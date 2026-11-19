@@ -1,0 +1,237 @@
+"""Persistent metadata for the EEG processing pipeline."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from enum import Enum
+
+from sqlalchemy import Column, LargeBinary, Text, UniqueConstraint
+from sqlmodel import Field, SQLModel
+
+from backend.app.database.models.types import EnumString
+
+def utc_now() -> datetime:
+    """Return the current timezone-aware UTC timestamp.
+
+    Returns
+    -------
+    datetime
+        Current UTC time for database audit fields.
+    """
+
+    return datetime.now(timezone.utc)
+
+
+class AnalysisStatus(str, Enum):
+    """Session-level states for the asynchronous EEG pipeline."""
+
+    QUEUED = "queued"
+    VALIDATING = "validating"
+    DEIDENTIFYING = "deidentifying"
+    PREPROCESSING = "preprocessing"
+    INFERENCE = "inference"
+    EXPLAINING = "explaining"
+    COMPLETED = "completed"
+    COMPLETED_WITH_ERRORS = "completed_with_errors"
+    FAILED = "failed"
+
+
+class RecordingStatus(str, Enum):
+    """Per-recording states within a session."""
+
+    UPLOADED = "uploaded"
+    VALIDATING = "validating"
+    DEIDENTIFIED = "deidentified"
+    PROCESSING = "processing"
+    PROCESSED = "processed"
+    INFERRED = "inferred"
+    FAILED = "failed"
+
+
+class ProcessingStage(str, Enum):
+    """Pipeline stages recorded in processing-attempt audit rows."""
+
+    VALIDATION = "validation"
+    DEIDENTIFICATION = "deidentification"
+    PREPROCESSING = "preprocessing"
+    INFERENCE = "inference"
+    EXPLAINABILITY = "explainability"
+
+
+class ProcessingStatus(str, Enum):
+    """Execution states for an individual processing attempt."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class EEGSession(SQLModel, table=True):
+    """Database metadata for one uploaded EEG archive."""
+
+    __tablename__ = "sessions"
+    __table_args__ = (UniqueConstraint("session_id"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    owner_user_id: int | None = Field(default=None, foreign_key="users.id", index=True)
+    session_id: str = Field(index=True)
+    upload_draft_id: str | None = Field(
+        default=None,
+        index=True,
+        max_length=64,
+        unique=True,
+    )
+    case_id: str | None = Field(default=None, index=True, max_length=64)
+    privacy_method: str = Field(default="metadata-scrub", max_length=64)
+    retention_policy: str = Field(default="legacy", max_length=32)
+    original_filename: str = ""
+    original_path: str = ""
+    # Alembic intentionally stores statuses as VARCHAR. Keep Python enum
+    # conversion without asking PostgreSQL for a native enum type.
+    status: AnalysisStatus = Field(
+        default=AnalysisStatus.QUEUED,
+        sa_column=Column(
+            EnumString(AnalysisStatus),
+            nullable=False,
+            index=True,
+        ),
+    )
+    current_stage: str | None = None
+    error_message: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+
+class UploadDraft(SQLModel, table=True):
+    """Encrypted, short-lived upload waiting for a privacy selection."""
+
+    __tablename__ = "upload_drafts"
+    __table_args__ = (UniqueConstraint("draft_id"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    owner_user_id: int | None = Field(default=None, foreign_key="users.id", index=True)
+    draft_id: str = Field(index=True, max_length=64)
+    encrypted_path: str = Field(max_length=1024)
+    created_at: datetime = Field(default_factory=utc_now)
+    expires_at: datetime
+
+
+class EEGRecording(SQLModel, table=True):
+    """Database metadata for one EEG recording extracted from a session archive."""
+
+    __tablename__ = "recordings"
+    __table_args__ = (UniqueConstraint("record_id"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    record_id: str = Field(index=True)
+    session_db_id: int = Field(foreign_key="sessions.id", index=True)
+    sequence_index: int = Field(default=1, ge=1)
+    original_filename: str
+    extracted_path: str | None = None
+    deidentified_path: str | None = None
+    original_artifact_path: str | None = None
+    retained_artifact_path: str | None = None
+    preprocessed_path: str | None = None
+    duration_seconds: float | None = None
+    sampling_rate: int | None = None
+    channel_count: int | None = None
+    source_format: str | None = Field(default=None, max_length=32)
+    source_checksum_sha256: str | None = Field(default=None, max_length=64)
+    conversion_details_json: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    reference_annotation_source: str | None = None
+    reference_intervals_json: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    annotation_events_json: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    video_sync_status: str = Field(default="unavailable", max_length=24)
+    video_sync_nonce: bytes | None = Field(
+        default=None,
+        sa_column=Column(LargeBinary, nullable=True),
+    )
+    video_sync_ciphertext: bytes | None = Field(
+        default=None,
+        sa_column=Column(LargeBinary, nullable=True),
+    )
+    status: RecordingStatus = Field(
+        default=RecordingStatus.UPLOADED,
+        sa_column=Column(
+            EnumString(RecordingStatus),
+            nullable=False,
+            index=True,
+        ),
+    )
+    error_message: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ProcessingAttempt(SQLModel, table=True):
+    """Audit row describing one background-task attempt at one stage."""
+
+    __tablename__ = "processing_attempts"
+
+    id: int | None = Field(default=None, primary_key=True)
+    recording_db_id: int | None = Field(default=None, foreign_key="recordings.id", index=True)
+    session_db_id: int = Field(foreign_key="sessions.id", index=True)
+    stage: ProcessingStage = Field(
+        sa_column=Column(
+            EnumString(ProcessingStage),
+            nullable=False,
+        ),
+    )
+    status: ProcessingStatus = Field(
+        default=ProcessingStatus.PENDING,
+        sa_column=Column(
+            EnumString(ProcessingStatus),
+            nullable=False,
+        ),
+    )
+    error_message: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class Prediction(SQLModel, table=True):
+    """Window-level output produced by a versioned inference service."""
+
+    __tablename__ = "predictions"
+
+    id: int | None = Field(default=None, primary_key=True)
+    recording_db_id: int = Field(foreign_key="recordings.id", index=True)
+    window_index: int = Field(ge=0)
+    model_name: str
+    model_version: str
+    threshold: float = Field(default=0.5, ge=0, le=1)
+    probability: float = Field(ge=0, le=1)
+    raw_score: float | None = Field(default=None, ge=0, le=1)
+    calibrated_probability: float | None = Field(default=None, ge=0, le=1)
+    score_type: str = Field(default="development_score", max_length=64)
+    calibration_method: str | None = Field(default=None, max_length=64)
+    calibration_version: str | None = Field(default=None, max_length=128)
+    calibration_dataset: str | None = Field(default=None, max_length=128)
+    privacy_method: str = Field(default="metadata-scrub", max_length=64)
+    seizure_detected: bool
+    start_seconds: float = Field(ge=0)
+    end_seconds: float = Field(ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class Explanation(SQLModel, table=True):
+    """Metadata pointing to an explanation artifact for one prediction."""
+
+    __tablename__ = "explanations"
+
+    id: int | None = Field(default=None, primary_key=True)
+    prediction_db_id: int = Field(foreign_key="predictions.id", index=True)
+    method: str
+    explanation_path: str
+    explanation_data: str | None = None
+    is_clinical: bool = False
+    created_at: datetime = Field(default_factory=utc_now)

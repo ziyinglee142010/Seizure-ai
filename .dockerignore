@@ -1,0 +1,13 @@
+# Source-only build context. Local datasets, secrets and artifacts stay out.
+**
+!backend/
+!backend/**/
+!backend/**/*.py
+!backend/Dockerfile
+!backend/requirements-video-detection.txt
+!backend/requirements*.txt
+!backend/alembic.ini
+backend/storage/
+backend/database/
+backend/model/
+**/__pycache__/

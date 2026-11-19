@@ -1,0 +1,22 @@
+# EEG seizure detection with MCS18's SeizureTransformer (the default launcher profile).
+# Place the MCS18 weights at backend/model/official_seizure_transformer_model.pth
+# (ignored by git). The file is mounted read-only; nothing else is exposed.
+services:
+  backend:
+    environment:
+      MODEL_RUNTIME: seizure_transformer
+      SEIZURE_TRANSFORMER_MODEL_PATH: /opt/eeg-model/official_seizure_transformer_model.pth
+      SEIZURE_TRANSFORMER_SHA256: ${SEIZURE_TRANSFORMER_SHA256:-}
+      SEIZURE_TRANSFORMER_THRESHOLD: ${SEIZURE_TRANSFORMER_THRESHOLD:-0.25}
+    volumes:
+      - type: volume
+        source: seizure_transformer_mountpoints
+        target: /opt/eeg-model
+        read_only: true
+      - type: bind
+        source: ./backend/model/official_seizure_transformer_model.pth
+        target: /opt/eeg-model/official_seizure_transformer_model.pth
+        read_only: true
+
+volumes:
+  seizure_transformer_mountpoints:

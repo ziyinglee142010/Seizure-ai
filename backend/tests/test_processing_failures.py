@@ -1,0 +1,798 @@
+"""Regression tests for recording-level processing cleanup."""
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+import io
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import numpy as np
+from fastapi import UploadFile
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import Session, SQLModel, create_engine, select
+
+from backend.app.database.models.eeg import (
+    AnalysisStatus,
+    EEGRecording,
+    EEGSession,
+    Explanation,
+    Prediction,
+    ProcessingAttempt,
+    ProcessingStage,
+    ProcessingStatus,
+    RecordingStatus,
+    UploadDraft,
+)
+from backend.app.database.repository import get_session_by_public_id, get_upload_draft, list_predictions, list_predictions_for_processing, list_recordings_for_session
+from backend.app.ml.interface import WindowPrediction
+from backend.app.ml.h5_inference import H5InferenceService, H5ModelError
+from backend.app.services.explanation_service import build_score_summary
+from backend.app.services.processing_service import (
+    _process_record,
+    _retain_positive_artifact,
+    process_session,
+    sweep_interrupted_sessions,
+)
+from backend.app.services.session_service import create_session, create_upload_draft, finalize_upload_draft
+from backend.app.services.storage_service import SessionStorage, StorageError
+
+
+class ProcessingFailureTests(unittest.TestCase):
+    """Ensure a late stage failure cannot leave a public model alert behind."""
+
+    def test_explanation_write_failure_preserves_discontinuous_nicolet_predictions(self) -> None:
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory, Session(database) as db:
+            root = Path(directory)
+            source = root / "recording.e"
+            source.write_bytes(b"synthetic source")
+            storage = SessionStorage(root / "storage", b"s" * 32)
+            session = EEGSession(session_id="SES-GAPPED-NICOLET")
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            record = EEGRecording(
+                record_id="REC-GAPPED-NICOLET",
+                session_db_id=session.id or 0,
+                sequence_index=1,
+                original_filename="recording.e",
+                extracted_path=str(source),
+            )
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+
+            layout = [
+                {"sample_start": 0, "sample_count": 1024, "start_seconds": 0.0, "duration_seconds": 4.0},
+                {"sample_start": 1024, "sample_count": 1024, "start_seconds": 10.0, "duration_seconds": 4.0},
+            ]
+            model_layout = [(0, 1024, 0.0, 4.0), (1024, 1024, 10.0, 4.0)]
+            prepared_windows = np.zeros((2, 1024, 18), dtype=np.float32)
+            starts = np.asarray([0.0, 10.0], dtype=np.float32)
+
+            class NoAlertInference:
+                model_name: str = "test-model"
+                model_version: str = "1"
+                threshold: float = 0.5
+                score_type: str = "uncalibrated_probability"
+                calibration_method: str | None = None
+
+                def predict(
+                    self,
+                    windows: np.ndarray,
+                    window_starts: np.ndarray,
+                    record_id: str,
+                    privacy_method: str = "metadata-scrub",
+                ) -> list[WindowPrediction]:
+                    return [
+                        WindowPrediction(
+                            index,
+                            float(start),
+                            float(start + 4),
+                            0.1,
+                            False,
+                            score_type=self.score_type,
+                            raw_score=0.1,
+                        )
+                        for index, start in enumerate(window_starts)
+                    ]
+
+            def write_scrubbed(_source, destination, _record_id):
+                Path(destination).write_bytes(b"synthetic de-identified signal")
+                return Path(destination)
+
+            commit = db.commit
+
+            def fail_explanation_commit():
+                if any(isinstance(row, Explanation) for row in db.new):
+                    raise IntegrityError("explanation foreign key", {}, RuntimeError())
+                commit()
+
+            with (
+                patch(
+                    "backend.app.services.processing_service.validate_eeg",
+                    return_value={
+                        "format": "nicolet-e",
+                        "duration_seconds": 14.0,
+                        "sampling_rate": 256,
+                        "channel_count": 18,
+                        "conversion_details": {
+                            "has_time_gaps": True,
+                            "model_segments": layout,
+                        },
+                    },
+                ),
+                patch(
+                    "backend.app.services.processing_service._sha256_file",
+                    return_value="a" * 64,
+                ),
+                patch(
+                    "backend.app.services.processing_service.deidentify_eeg",
+                    side_effect=write_scrubbed,
+                ),
+                patch(
+                    "backend.app.services.processing_service.preprocess_eeg",
+                    return_value=(prepared_windows, starts, {}),
+                ) as preprocess,
+                patch.object(db, "commit", side_effect=fail_explanation_commit),
+            ):
+                _process_record(db, session, record, storage, NoAlertInference())
+
+            preprocess.assert_called_once_with(
+                str(record.deidentified_path),
+                segments=model_layout,
+            )
+            db.refresh(record)
+            self.assertEqual(record.status, RecordingStatus.INFERRED)
+            self.assertEqual(record.duration_seconds, 14.0)
+            self.assertIsNone(record.retained_artifact_path)
+            self.assertEqual(len(list_predictions_for_processing(db, record.id)), 2)
+            self.assertEqual(db.exec(select(Explanation)).all(), [])
+            attempt = db.exec(
+                select(ProcessingAttempt).where(
+                    ProcessingAttempt.stage == ProcessingStage.EXPLAINABILITY
+                )
+            ).one()
+            self.assertEqual(attempt.status, ProcessingStatus.FAILED)
+
+    def test_discontinuous_positive_retention_preserves_segment_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = SessionStorage(Path(directory) / "storage", b"s" * 32)
+            session = EEGSession(session_id="SES-GAPPED-RETAIN")
+            record = EEGRecording(
+                record_id="REC-GAPPED-RETAIN",
+                session_db_id=1,
+                sequence_index=1,
+                original_filename="recording.e",
+                duration_seconds=14.0,
+                source_format="nicolet-e",
+            )
+            windows = np.zeros((2, 1024, 18), dtype=np.float32)
+            starts = np.asarray([0.0, 10.0], dtype=np.float32)
+            predictions = [
+                WindowPrediction(0, 0.0, 4.0, 0.1, False),
+                WindowPrediction(1, 10.0, 14.0, 0.9, True),
+            ]
+
+            encrypted_path = _retain_positive_artifact(
+                session=session,
+                record=record,
+                storage=storage,
+                source_path=Path(directory) / "unused-contiguous-timeline.edf",
+                model_windows=windows,
+                window_starts=starts,
+                predictions=predictions,
+                has_time_gaps=True,
+            )
+
+            self.assertIsNotNone(encrypted_path)
+            if encrypted_path is None:
+                self.fail("Discontinuous positive model windows were not retained.")
+            self.assertTrue(str(encrypted_path).endswith(".npz.enc"))
+            preview_path = storage.materialize_retained_artifact(
+                session.session_id,
+                Path(encrypted_path),
+                "gapped-preview.npz",
+            )
+            with np.load(preview_path) as artifact:
+                np.testing.assert_array_equal(
+                    artifact["window_start_seconds"],
+                    np.asarray([0.0, 10.0], dtype=np.float32),
+                )
+
+    def test_malformed_embedded_events_fail_only_their_recording(self) -> None:
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with Session(database) as db:
+            db.add(
+                EEGSession(
+                    session_id="SES-MALFORMED-EVENTS",
+                    original_filename="",
+                    original_path="/private/archive.enc",
+                )
+            )
+            db.commit()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            malformed = root / "malformed.e"
+            valid = root / "valid.e"
+            malformed.write_bytes(b"synthetic malformed recording")
+            valid.write_bytes(b"synthetic valid recording")
+            storage = SessionStorage(root / "storage", b"s" * 32)
+            storage.materialize_archive = MagicMock(return_value=root / "archive.zip")
+            storage.read_reference_annotations = MagicMock(return_value={})
+            storage.extract_edfs = MagicMock(return_value=[malformed, valid])
+            storage.cleanup_session = MagicMock()
+            processed: list[str] = []
+
+            def read_events(path: Path):
+                if path == malformed:
+                    raise ValueError("synthetic malformed event packet")
+                return ()
+
+            def process_record(db, _session, record, _storage, _inference):
+                source_name = Path(record.extracted_path or "").name
+                processed.append(source_name)
+                if source_name == malformed.name:
+                    raise ValueError("synthetic malformed event packet")
+                record.status = RecordingStatus.INFERRED
+                db.add(record)
+                db.commit()
+
+            with (
+                patch("backend.app.services.processing_service.engine", database),
+                patch(
+                    "backend.app.services.processing_service.SessionStorage",
+                    return_value=storage,
+                ),
+                patch(
+                    "backend.app.services.processing_service.get_inference_service",
+                    return_value=object(),
+                ),
+                patch(
+                    "backend.app.services.processing_service._process_record",
+                    side_effect=process_record,
+                ),
+                patch(
+                    "backend.app.services.storage_service.read_legacy_eeg_events",
+                    side_effect=read_events,
+                ),
+            ):
+                process_session("SES-MALFORMED-EVENTS")
+
+        self.assertCountEqual(processed, [malformed.name, valid.name])
+        with Session(database) as db:
+            session = get_session_by_public_id(db, "SES-MALFORMED-EVENTS")
+            self.assertIsNotNone(session)
+            assert session is not None
+            records = list_recordings_for_session(db, session.id)
+        self.assertEqual(session.status, AnalysisStatus.COMPLETED_WITH_ERRORS)
+        self.assertEqual(
+            {record.sequence_index: record.status for record in records},
+            {1: RecordingStatus.FAILED, 2: RecordingStatus.INFERRED},
+        )
+
+    def test_failed_recording_removes_predictions_and_explanations(self) -> None:
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with Session(database) as db:
+            db.add(
+                EEGSession(
+                    session_id="SES-LATE-FAILURE",
+                    original_filename="",
+                    original_path="/private/archive.enc",
+                )
+            )
+            db.commit()
+
+        storage = MagicMock()
+        storage.materialize_archive.return_value = Path("/private/archive.zip")
+        storage.read_reference_annotations.return_value = {}
+        storage.extract_edfs.return_value = [Path("/private/recording.edf")]
+
+        def fail_after_outputs(db, _session, record, _storage, inference):
+            prediction = Prediction(
+                recording_db_id=record.id,
+                window_index=0,
+                model_name="development-stub",
+                model_version="stub-0.1.0",
+                threshold=0.5,
+                probability=0.9,
+                raw_score=0.9,
+                score_type="development_score",
+                seizure_detected=True,
+                start_seconds=0,
+                end_seconds=4,
+            )
+            db.add(prediction)
+            db.commit()
+            db.refresh(prediction)
+            db.add(
+                Explanation(
+                    prediction_db_id=prediction.id,
+                    method="development-stub",
+                    explanation_path="",
+                    explanation_data="{}",
+                )
+            )
+            record.retained_artifact_path = "/private/retained.enc"
+            db.add(record)
+            db.commit()
+            raise RuntimeError("late stage failure")
+
+        with (
+            patch("backend.app.services.processing_service.engine", database),
+            patch("backend.app.services.processing_service.SessionStorage", return_value=storage),
+            patch("backend.app.services.processing_service._process_record", side_effect=fail_after_outputs),
+        ):
+            process_session("SES-LATE-FAILURE")
+
+        with Session(database) as db:
+            session = get_session_by_public_id(db, "SES-LATE-FAILURE")
+            self.assertEqual(session.status, AnalysisStatus.COMPLETED_WITH_ERRORS)
+            record = list_recordings_for_session(db, session.id)[0]
+            self.assertEqual(record.status, RecordingStatus.FAILED)
+            self.assertIsNone(record.retained_artifact_path)
+            self.assertEqual(db.exec(select(Prediction)).all(), [])
+            self.assertEqual(db.exec(select(Explanation)).all(), [])
+        storage.delete_retained_artifact.assert_called_once_with(Path("/private/retained.enc"))
+
+    def test_record_cleanup_failure_keeps_terminal_failure_retryable(self) -> None:
+        """A cleanup error cannot leave a failed recording publicly inferred."""
+
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with Session(database) as db:
+            db.add(EEGSession(session_id="SES-RETRY-CLEANUP", original_path="/private/archive.enc"))
+            db.commit()
+
+        storage = MagicMock()
+        storage.materialize_archive.return_value = Path("/private/archive.zip")
+        storage.read_reference_annotations.return_value = {}
+        storage.extract_edfs.return_value = [Path("/private/recording.edf")]
+        storage.delete_retained_artifact.side_effect = StorageError("private cleanup failed")
+
+        def fail_after_outputs(db, _session, record, _storage, _inference):
+            db.add(Prediction(
+                recording_db_id=record.id,
+                window_index=0,
+                model_name="test-model",
+                model_version="1",
+                probability=0.9,
+                seizure_detected=True,
+                start_seconds=0,
+                end_seconds=4,
+            ))
+            record.status = RecordingStatus.INFERRED
+            record.retained_artifact_path = "/private/retained.enc"
+            db.add(record)
+            db.commit()
+            raise RuntimeError("private internal failure")
+
+        with (
+            patch("backend.app.services.processing_service.engine", database),
+            patch("backend.app.services.processing_service.SessionStorage", return_value=storage),
+            patch("backend.app.services.processing_service._process_record", side_effect=fail_after_outputs),
+        ):
+            process_session("SES-RETRY-CLEANUP")
+
+        with Session(database) as db:
+            session = get_session_by_public_id(db, "SES-RETRY-CLEANUP")
+            record = list_recordings_for_session(db, session.id)[0]
+            self.assertEqual(session.status, AnalysisStatus.COMPLETED_WITH_ERRORS)
+            self.assertEqual(record.status, RecordingStatus.FAILED)
+            self.assertEqual(record.retained_artifact_path, "/private/retained.enc")
+            self.assertEqual(db.exec(select(Prediction)).all(), [])
+            self.assertNotIn("private internal failure", record.error_message or "")
+
+    def test_predictions_are_private_until_recording_is_inferred(self) -> None:
+        """An active recording must not publish partially committed model output."""
+
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with Session(database) as db:
+            session = EEGSession(session_id="SES-ACTIVE")
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            record = EEGRecording(
+                record_id="REC-ACTIVE",
+                session_db_id=session.id,
+                sequence_index=1,
+                original_filename="",
+                status=RecordingStatus.PROCESSED,
+            )
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+            db.add(Prediction(
+                recording_db_id=record.id,
+                window_index=0,
+                model_name="test-model",
+                model_version="1",
+                probability=0.9,
+                seizure_detected=True,
+                start_seconds=0,
+                end_seconds=4,
+            ))
+            db.commit()
+
+            self.assertEqual(list_predictions(db, record.id), [])
+            self.assertEqual(len(list_predictions_for_processing(db, record.id)), 1)
+
+    def test_retained_artifact_is_removed_when_record_commit_fails(self) -> None:
+        """A commit failure after encryption cannot orphan a retained EEG clip."""
+
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory, Session(database) as db:
+            storage = SessionStorage(Path(directory) / "sessions", b"s" * 32)
+            session = EEGSession(session_id="SES-ARTIFACT", privacy_method="metadata-scrub")
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            record = EEGRecording(
+                record_id="REC-ARTIFACT",
+                session_db_id=session.id,
+                sequence_index=1,
+                original_filename="",
+                extracted_path="/private/recording.edf",
+            )
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+
+            class PositiveInference:
+                model_name = "test-model"
+                model_version = "1"
+                threshold = 0.5
+                score_type = "uncalibrated_probability"
+                calibration_method = None
+
+                def predict(self, windows, starts, _record_id, privacy_method="metadata-scrub"):
+                    return [WindowPrediction(0, float(starts[0]), float(starts[0] + 4), 0.9, True, score_type=self.score_type, raw_score=0.9)]
+
+            artifact = storage.directory(session.session_id, "retained") / "REC-ARTIFACT.edf.enc"
+
+            def retain_artifact(**_kwargs):
+                artifact.write_bytes(b"encrypted")
+                return str(artifact)
+
+            real_commit = db.commit
+            failed_once = False
+
+            def fail_artifact_commit():
+                nonlocal failed_once
+                if not failed_once and record.retained_artifact_path:
+                    failed_once = True
+                    raise RuntimeError("injected commit failure")
+                real_commit()
+
+            pipeline_calls: list[tuple[str, str]] = []
+
+            def scrub_before_model(source_path, destination_path, _record_id):
+                pipeline_calls.append(("scrub", str(destination_path)))
+                return Path(destination_path)
+
+            def preprocess_scrubbed(path):
+                pipeline_calls.append(("preprocess", str(path)))
+                return np.zeros((1, 1024, 18), dtype=np.float32), np.asarray([0.0], dtype=np.float32), {}
+
+            with (
+                patch("backend.app.services.processing_service.validate_edf", return_value={"duration_seconds": 4.0, "sampling_rate": 256, "channel_count": 18}),
+                patch("backend.app.services.processing_service._sha256_file", return_value="a" * 64),
+                patch("backend.app.services.processing_service.deidentify_edf", side_effect=scrub_before_model),
+                patch("backend.app.services.processing_service.preprocess_edf", side_effect=preprocess_scrubbed),
+                patch("backend.app.services.processing_service._retain_positive_artifact", side_effect=retain_artifact),
+                patch.object(db, "commit", side_effect=fail_artifact_commit),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected commit failure"):
+                    _process_record(db, session, record, storage, PositiveInference())
+
+            self.assertEqual([call[0] for call in pipeline_calls], ["scrub", "preprocess"])
+            self.assertEqual(pipeline_calls[0][1], pipeline_calls[1][1])
+
+            self.assertFalse(artifact.exists())
+            attempts = db.exec(select(ProcessingAttempt).where(ProcessingAttempt.stage == ProcessingStage.EXPLAINABILITY)).all()
+            self.assertEqual(attempts[-1].status, ProcessingStatus.FAILED)
+            self.assertIsNotNone(attempts[-1].finished_at)
+
+    def test_upload_commit_failure_removes_archive_and_session_row(self) -> None:
+        """A database failure after encrypted storage leaves no orphan session."""
+
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory, Session(database) as db:
+            storage = SessionStorage(Path(directory) / "sessions", b"s" * 32)
+            archive = UploadFile(filename="recordings.zip", file=io.BytesIO(b"PK\x03\x04test"))
+            with patch.object(db, "commit", side_effect=RuntimeError("injected commit failure")):
+                with self.assertRaisesRegex(RuntimeError, "injected commit failure"):
+                    asyncio.run(create_session(db, storage, archive))
+
+            self.assertEqual(db.exec(select(EEGSession)).all(), [])
+            self.assertEqual(list(storage.root.iterdir()), [])
+
+    def test_cancelled_session_upload_removes_archive_and_session_row(self) -> None:
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory, Session(database) as db:
+            storage = SessionStorage(Path(directory) / "sessions", b"s" * 32)
+            archive = UploadFile(filename="recordings.zip", file=io.BytesIO(b"PK\x03\x04test"))
+            with patch.object(storage, "save_upload", new=AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    asyncio.run(create_session(db, storage, archive))
+
+            self.assertEqual(db.exec(select(EEGSession)).all(), [])
+            if storage.root.exists():
+                self.assertEqual(list(storage.root.iterdir()), [])
+            self.assertTrue(archive.file.closed)
+
+    def test_cancelled_draft_upload_removes_archive_and_draft_row(self) -> None:
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory, Session(database) as db:
+            storage = SessionStorage(Path(directory) / "sessions", b"s" * 32)
+            archive = UploadFile(filename="recordings.zip", file=io.BytesIO(b"PK\x03\x04test"))
+            with patch.object(storage, "save_draft_upload", new=AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    asyncio.run(
+                        create_upload_draft(
+                            db,
+                            storage,
+                            archive,
+                            datetime.now(timezone.utc) + timedelta(minutes=30),
+                        )
+                    )
+
+            self.assertEqual(db.exec(select(UploadDraft)).all(), [])
+            if storage.root.exists():
+                self.assertEqual(list(storage.root.iterdir()), [])
+            self.assertTrue(archive.file.closed)
+
+    def test_failed_draft_promotion_keeps_retryable_encrypted_draft(self) -> None:
+        """A failed finalization keeps the staged upload consistent for retry."""
+
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory, Session(database) as db:
+            storage = SessionStorage(Path(directory) / "sessions", b"s" * 32)
+            draft = asyncio.run(create_upload_draft(
+                db,
+                storage,
+                UploadFile(filename="recordings.zip", file=io.BytesIO(b"PK\x03\x04test")),
+                datetime.now(timezone.utc) + timedelta(minutes=30),
+            ))
+            draft_path = Path(draft.encrypted_path)
+
+            with patch.object(db, "commit", side_effect=RuntimeError("injected commit failure")):
+                with self.assertRaisesRegex(RuntimeError, "injected commit failure"):
+                    finalize_upload_draft(db, storage, draft.draft_id)
+
+            db.expire_all()
+            self.assertTrue(draft_path.exists())
+            self.assertEqual(db.exec(select(EEGSession)).all(), [])
+            self.assertIsNotNone(get_upload_draft(db, draft.draft_id))
+            retry = finalize_upload_draft(db, storage, draft.draft_id).session
+            self.assertTrue(Path(retry.original_path).exists())
+            self.assertFalse(draft_path.exists())
+
+    def test_finalization_does_not_report_failure_after_session_commit(self) -> None:
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory, Session(database) as db:
+            storage = SessionStorage(Path(directory) / "sessions", b"s" * 32)
+            draft = asyncio.run(
+                create_upload_draft(
+                    db,
+                    storage,
+                    UploadFile(filename="recordings.zip", file=io.BytesIO(b"PK\x03\x04test")),
+                    datetime.now(timezone.utc) + timedelta(minutes=30),
+                )
+            )
+            with patch.object(storage, "delete_draft", side_effect=StorageError("temporary cleanup failure")):
+                session = finalize_upload_draft(db, storage, draft.draft_id).session
+
+            self.assertIsNotNone(get_session_by_public_id(db, session.session_id))
+            self.assertTrue(Path(session.original_path).exists())
+            self.assertTrue(Path(draft.encrypted_path).exists())
+
+    def test_commit_acknowledgement_loss_recovers_the_committed_session(self) -> None:
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory, Session(database) as db:
+            storage = SessionStorage(Path(directory) / "sessions", b"s" * 32)
+            draft = asyncio.run(
+                create_upload_draft(
+                    db,
+                    storage,
+                    UploadFile(filename="recordings.zip", file=io.BytesIO(b"PK\x03\x04test")),
+                    datetime.now(timezone.utc) + timedelta(minutes=30),
+                )
+            )
+            commit = db.commit
+
+            def commit_then_lose_acknowledgement() -> None:
+                commit()
+                raise RuntimeError("commit acknowledgement lost")
+
+            with patch.object(db, "commit", side_effect=commit_then_lose_acknowledgement):
+                finalization = finalize_upload_draft(db, storage, draft.draft_id)
+
+            self.assertTrue(finalization.created)
+            self.assertEqual(finalization.session.upload_draft_id, draft.draft_id)
+            self.assertEqual(len(db.exec(select(EEGSession)).all()), 1)
+            self.assertTrue(Path(finalization.session.original_path).exists())
+
+    def test_h5_runtime_rejects_non_finite_scores(self) -> None:
+        """NaN cannot silently become a negative H5 prediction."""
+
+        service = H5InferenceService.__new__(H5InferenceService)
+        service.model = MagicMock()
+        service.model.predict.return_value = np.asarray([[np.nan]], dtype=np.float32)
+        service.threshold = 0.5
+        service.score_type = "uncalibrated_probability"
+        service.calibration_method = None
+        service.temperature = None
+        with self.assertRaises(H5ModelError):
+            service.predict(
+                np.zeros((1, 1024, 18), dtype=np.float32),
+                np.asarray([0.0], dtype=np.float32),
+                "REC-NAN",
+            )
+
+    def test_real_model_score_summary_is_not_labelled_as_stub_output(self) -> None:
+        """A reviewed runtime receives a neutral score summary, not a fake explanation."""
+
+        payload = build_score_summary(
+            record_id="REC-H5",
+            prediction=WindowPrediction(
+                0,
+                0.0,
+                4.0,
+                0.8,
+                True,
+                score_type="uncalibrated_probability",
+                raw_score=0.8,
+            ),
+            model_name="reviewed-h5",
+            model_version="1",
+        )
+        self.assertEqual(payload["method"], "window-score-summary")
+        self.assertNotIn("deterministic development", payload["note"].lower())
+
+    def test_startup_sweep_reconciles_interrupted_session(self) -> None:
+        """An interrupted EEG task becomes terminal and loses transient files."""
+
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory:
+            storage = SessionStorage(Path(directory) / "sessions", b"s" * 32)
+            original = storage.directory("SES-INTERRUPTED", "original") / "archive.zip.enc"
+            extracted = storage.directory("SES-INTERRUPTED", "extracted") / "record.edf"
+            original.write_bytes(b"encrypted")
+            extracted.write_bytes(b"transient")
+            with Session(database) as db:
+                session = EEGSession(
+                    session_id="SES-INTERRUPTED",
+                    original_filename="archive.zip",
+                    original_path=str(original),
+                    status=AnalysisStatus.INFERENCE,
+                    current_stage="inference",
+                )
+                db.add(session)
+                db.commit()
+                db.refresh(session)
+                record = EEGRecording(
+                    record_id="REC-INTERRUPTED",
+                    session_db_id=session.id,
+                    sequence_index=1,
+                    original_filename="record.edf",
+                    extracted_path=str(extracted),
+                    status=RecordingStatus.PROCESSING,
+                )
+                attempt = ProcessingAttempt(
+                    session_db_id=session.id,
+                    recording_db_id=None,
+                    stage=ProcessingStage.INFERENCE,
+                    status=ProcessingStatus.RUNNING,
+                    started_at=datetime.now(timezone.utc),
+                )
+                db.add(record)
+                db.add(attempt)
+                db.commit()
+
+            with (
+                patch("backend.app.services.processing_service.engine", database),
+                patch("backend.app.services.processing_service.SessionStorage", return_value=storage),
+            ):
+                sweep_interrupted_sessions()
+
+            with Session(database) as db:
+                session = get_session_by_public_id(db, "SES-INTERRUPTED")
+                record = list_recordings_for_session(db, session.id)[0]
+                attempt = db.exec(select(ProcessingAttempt)).one()
+                self.assertEqual(session.status, AnalysisStatus.FAILED)
+                self.assertIsNone(session.current_stage)
+                self.assertEqual(record.status, RecordingStatus.FAILED)
+                self.assertIsNone(record.extracted_path)
+                self.assertEqual(attempt.status, ProcessingStatus.FAILED)
+                self.assertFalse(storage.root.joinpath("SES-INTERRUPTED").exists())
+
+    def test_periodic_sweep_does_not_interrupt_active_session(self) -> None:
+        """The retention loop leaves in-flight work and files untouched."""
+
+        database = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        self.addCleanup(database.dispose)
+        SQLModel.metadata.create_all(database)
+        with tempfile.TemporaryDirectory() as directory:
+            storage = SessionStorage(Path(directory) / "sessions", b"s" * 32)
+            original = storage.directory("SES-ACTIVE", "original") / "archive.zip.enc"
+            extracted = storage.directory("SES-ACTIVE", "extracted") / "record.edf"
+            original.write_bytes(b"encrypted")
+            extracted.write_bytes(b"transient")
+            with Session(database) as db:
+                session = EEGSession(
+                    session_id="SES-ACTIVE",
+                    original_path=str(original),
+                    status=AnalysisStatus.INFERENCE,
+                    current_stage="inference",
+                )
+                db.add(session)
+                db.commit()
+                db.refresh(session)
+                record = EEGRecording(
+                    record_id="REC-ACTIVE",
+                    session_db_id=session.id,
+                    sequence_index=1,
+                    original_filename="record.edf",
+                    extracted_path=str(extracted),
+                    status=RecordingStatus.PROCESSING,
+                )
+                attempt = ProcessingAttempt(
+                    session_db_id=session.id,
+                    stage=ProcessingStage.INFERENCE,
+                    status=ProcessingStatus.RUNNING,
+                    started_at=datetime.now(timezone.utc),
+                )
+                db.add(record)
+                db.add(attempt)
+                db.commit()
+
+            with (
+                patch("backend.app.services.processing_service.engine", database),
+                patch("backend.app.services.processing_service.SessionStorage", return_value=storage),
+            ):
+                sweep_interrupted_sessions(reconcile_active=False)
+
+            with Session(database) as db:
+                session = get_session_by_public_id(db, "SES-ACTIVE")
+                record = list_recordings_for_session(db, session.id)[0]
+                attempt = db.exec(select(ProcessingAttempt)).one()
+                self.assertEqual(session.status, AnalysisStatus.INFERENCE)
+                self.assertIsNone(session.error_message)
+                self.assertEqual(record.status, RecordingStatus.PROCESSING)
+                self.assertIsNone(record.error_message)
+                self.assertEqual(attempt.status, ProcessingStatus.RUNNING)
+                self.assertTrue(original.exists())
+                self.assertTrue(extracted.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

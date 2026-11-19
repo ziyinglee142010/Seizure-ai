@@ -1,0 +1,426 @@
+"""Safe recording, prediction, explanation, and signal endpoints."""
+
+from __future__ import annotations
+
+import gzip
+import json
+import math
+from pathlib import Path
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
+from sqlmodel import Session
+
+from backend.app.core.config import ENABLE_FULL_SIGNAL_PREVIEW, ENABLE_SIGNAL_PREVIEW, FULL_SIGNAL_PREVIEW_MAX_SECONDS
+from backend.app.core.security import owner_id, require_owner_auth
+from backend.app.database.db import get_session
+from backend.app.database.models.auth import User
+from backend.app.database.models.eeg import EEGRecording
+from backend.app.database.repository import (
+    get_recording_by_public_id,
+    get_session_by_database_id,
+    list_flagged_window_counts,
+    list_explanations,
+    list_model_metadata,
+    list_predictions,
+)
+from backend.app.services.session_service import public_record
+from backend.app.services.signal_service import SignalPreviewUnavailable, build_signal_preview
+from backend.app.services.storage_service import SessionStorage, StorageError
+from backend.app.services.clinical_access_audit import record_clinical_access
+from backend.app.privacy.retention import model_alert_intervals
+from backend.app.ml.interface import public_score_type
+
+
+router = APIRouter(prefix="/api", tags=["recordings"])
+
+
+def _get_record(db: Session, record_id: str, owner_user_id: int | None = None) -> EEGRecording:
+    """Load a recording by its public identifier or raise HTTP 404.
+
+    Parameters
+    ----------
+    db : sqlmodel.Session
+        Database session for the request.
+    record_id : str
+        Opaque recording identifier supplied by the client.
+
+    Returns
+    -------
+    EEGRecording
+        The matching recording row.
+
+    Raises
+    ------
+    fastapi.HTTPException
+        Raised with status 404 when the recording does not exist.
+    """
+
+    record = get_recording_by_public_id(db, record_id, owner_user_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Recording was not found.")
+    return record
+
+
+def _audit_record_access(
+    db: Session,
+    current_user: User | None,
+    record: EEGRecording,
+    action: str,
+) -> None:
+    if record.id is not None:
+        record_clinical_access(
+            db,
+            actor_user_id=getattr(current_user, "id", None),
+            recording_db_id=record.id,
+            action=action,
+        )
+
+
+@router.get("/recordings/{record_id}")
+def get_recording(
+    record_id: str,
+    db: Session = Depends(get_session),
+    current_user: User | None = Depends(require_owner_auth),
+) -> dict:
+    """Return safe technical metadata for one recording.
+
+    Parameters
+    ----------
+    record_id : str
+        Opaque recording identifier.
+    db : sqlmodel.Session
+        Request-scoped database session.
+
+    Returns
+    -------
+    dict
+        Public recording metadata without patient references or filesystem
+        paths.
+    """
+
+    record = _get_record(db, record_id, owner_id(current_user))
+    _audit_record_access(db, current_user, record, "recording_view")
+    session = get_session_by_database_id(db, record.session_db_id, owner_id(current_user))
+    alert_count = list_flagged_window_counts(db, [record.id] if record.id is not None else []).get(record.id or 0, 0)
+    metadata = list_model_metadata(db, [record.id] if record.id is not None else []).get(record.id or 0)
+    intervals = model_alert_intervals(list_predictions(db, record.id))
+    return public_record(record, session, alert_count, metadata, intervals)
+
+
+@router.get("/recordings/{record_id}/prediction")
+def get_prediction(
+    record_id: str,
+    db: Session = Depends(get_session),
+    current_user: User | None = Depends(require_owner_auth),
+) -> dict:
+    """Return model metadata and window predictions for a recording.
+
+    Parameters
+    ----------
+    record_id : str
+        Opaque recording identifier.
+    db : sqlmodel.Session
+        Request-scoped database session.
+
+    Returns
+    -------
+    dict
+        Model version and one safe prediction object per EEG window.
+    """
+
+    record = _get_record(db, record_id, owner_id(current_user))
+    _audit_record_access(db, current_user, record, "prediction_view")
+    session = get_session_by_database_id(db, record.session_db_id, owner_id(current_user))
+    predictions = list_predictions(db, record.id)
+    first = predictions[0] if predictions else None
+    score_type = public_score_type(first.score_type) if first else None
+    calibrated = any(item.calibrated_probability is not None for item in predictions)
+    highest = max(predictions, key=lambda item: item.probability, default=None)
+    intervals = model_alert_intervals(predictions)
+    return {
+        "record_id": record.record_id,
+        "model": (
+            {
+                "name": first.model_name,
+                "version": first.model_version,
+                "threshold": first.threshold,
+                "score_type": score_type,
+                "calibrated": calibrated,
+                "calibration_method": first.calibration_method,
+                "calibration_version": first.calibration_version,
+                "calibration_dataset": first.calibration_dataset,
+                "privacy_method": session.privacy_method if session else first.privacy_method,
+            }
+            if first
+            else None
+        ),
+        "summary": {
+            "window_count": len(predictions),
+            "flagged_window_count": sum(item.seizure_detected for item in predictions),
+            "flagged_window_fraction": (
+                sum(item.seizure_detected for item in predictions) / len(predictions)
+                if predictions else 0.0
+            ),
+            "peak_window_score": max((item.probability for item in predictions), default=0.0),
+            "highest_window": (
+                {
+                    "start_seconds": highest.start_seconds,
+                    "end_seconds": highest.end_seconds,
+                    "score": highest.probability,
+                }
+                if highest is not None
+                else None
+            ),
+            "alert_intervals": [
+                {"start_seconds": start, "end_seconds": end}
+                for start, end in intervals
+            ],
+            "aggregation_unit": "window",
+            "recording_probability_available": False,
+        },
+        "predictions": [
+            {
+                "window_index": item.window_index,
+                "start_seconds": item.start_seconds,
+                "end_seconds": item.end_seconds,
+                "score": item.probability,
+                "raw_score": item.raw_score,
+                "calibrated_probability": item.calibrated_probability,
+                "score_type": public_score_type(item.score_type),
+                "calibration_method": item.calibration_method,
+                "calibration_version": item.calibration_version,
+                "calibration_dataset": item.calibration_dataset,
+                "seizure_detected": item.seizure_detected,
+            }
+            for item in predictions
+        ],
+    }
+
+
+@router.get("/recordings/{record_id}/annotations")
+def get_annotations(
+    record_id: str,
+    db: Session = Depends(get_session),
+    current_user: User | None = Depends(require_owner_auth),
+) -> dict:
+    """Return sanitized embedded EEG event timing for review alignment.
+
+    Raw Nicolet annotation text and sensitive report metadata are intentionally
+    never returned. Event kinds are research labels and require human review;
+    they are not clinical diagnoses or model ground truth.
+    """
+
+    record = _get_record(db, record_id, owner_id(current_user))
+    _audit_record_access(db, current_user, record, "annotation_view")
+    events: list[dict] = []
+    if record.annotation_events_json:
+        try:
+            decoded = json.loads(record.annotation_events_json)
+        except json.JSONDecodeError:
+            decoded = []
+        if isinstance(decoded, list):
+            for event in decoded:
+                if not isinstance(event, dict):
+                    continue
+                onset = event.get("onset_seconds")
+                duration = event.get("duration_seconds")
+                kind = event.get("kind")
+                text_present = event.get("text_present")
+                if (
+                    not isinstance(onset, (int, float))
+                    or not isinstance(duration, (int, float))
+                    or not math.isfinite(float(onset))
+                    or not math.isfinite(float(duration))
+                    or onset < 0
+                    or duration < 0
+                ):
+                    continue
+                if kind not in {"seizure_event", "manual_annotation", "other"}:
+                    continue
+                events.append(
+                    {
+                        "onset_seconds": float(onset),
+                        "duration_seconds": float(duration),
+                        "kind": kind,
+                        "text_present": bool(text_present),
+                    }
+                )
+    return {
+        "record_id": record.record_id,
+        "source": record.reference_annotation_source,
+        "human_review_required": True,
+        "events": events,
+    }
+
+
+@router.get("/recordings/{record_id}/explanation")
+def get_explanation(
+    record_id: str,
+    db: Session = Depends(get_session),
+    current_user: User | None = Depends(require_owner_auth),
+) -> dict:
+    """Return stored non-clinical explanation artifacts for a recording.
+
+    Parameters
+    ----------
+    record_id : str
+        Opaque recording identifier.
+    db : sqlmodel.Session
+        Request-scoped database session.
+
+    Returns
+    -------
+    dict
+        Explanation metadata and JSON payloads when the artifact is readable.
+        Internal artifact paths are never returned.
+    """
+
+    record = _get_record(db, record_id, owner_id(current_user))
+    _audit_record_access(db, current_user, record, "explanation_view")
+    predictions = list_predictions(db, record.id)
+    prediction_ids = [prediction.id for prediction in predictions if prediction.id is not None]
+    explanations = list_explanations(db, prediction_ids)
+    items = []
+    for explanation in explanations:
+        payload = None
+        if explanation.explanation_data:
+            try:
+                payload = json.loads(explanation.explanation_data)
+            except json.JSONDecodeError:
+                payload = None
+        items.append({
+            "method": explanation.method,
+            "is_clinical": explanation.is_clinical,
+            "data": public_explanation_payload(payload),
+        })
+    return {"record_id": record.record_id, "explanations": items}
+
+
+def public_explanation_payload(payload: object) -> object:
+    """Sanitize old explanation artifacts that used probability-named fields."""
+
+    if not isinstance(payload, dict):
+        return payload
+    result = dict(payload)
+    score_type = result.get("score_type")
+    if isinstance(score_type, str):
+        result["score_type"] = public_score_type(score_type)
+    if "probability" in result:
+        result.setdefault("score", result.pop("probability"))
+    return result
+
+
+@router.get("/recordings/{record_id}/signal", response_class=JSONResponse)
+def get_signal(
+    record_id: str,
+    request: Request,
+    start_seconds: float = Query(0, ge=0),
+    duration_seconds: float = Query(10, gt=0, le=7200),
+    max_points: int = Query(2000, gt=0, le=10000),
+    db: Session = Depends(get_session),
+    current_user: User | None = Depends(require_owner_auth),
+) -> Response:
+    """Return one owner-scoped, private waveform page.
+
+    Parameters
+    ----------
+    record_id : str
+        Opaque recording identifier.
+    start_seconds : float
+        Start time within the recording, defaulting to zero.
+    duration_seconds : float
+        Requested duration, bounded by the configured review limit.
+    max_points : int
+        Maximum number of samples returned per channel.
+    db : sqlmodel.Session
+        Request-scoped database session.
+
+    Returns
+    -------
+    Response
+        Bounded retained waveform JSON, gzip-compressed when accepted by the
+        requesting client, with model alert intervals.
+
+    Raises
+    ------
+    fastapi.HTTPException
+        Raised with HTTP 404 when waveform access or its retained artifact is
+        unavailable.
+    """
+    if not ENABLE_SIGNAL_PREVIEW:
+        raise HTTPException(
+            status_code=404,
+            detail="Waveform access is disabled by the service configuration.",
+        )
+    max_duration = FULL_SIGNAL_PREVIEW_MAX_SECONDS if ENABLE_FULL_SIGNAL_PREVIEW else 660.0
+    if duration_seconds > max_duration:
+        raise HTTPException(status_code=422, detail="The requested signal range is too large.")
+    record = _get_record(db, record_id, owner_id(current_user))
+    _audit_record_access(db, current_user, record, "waveform_view")
+    session = get_session_by_database_id(db, record.session_db_id, owner_id(current_user))
+    if session is None:
+        raise HTTPException(status_code=404, detail="Recording session was not found.")
+    try:
+        preview = build_signal_preview(
+            db,
+            session,
+            record,
+            SessionStorage(),
+            start_seconds,
+            duration_seconds,
+            max_points,
+        )
+        accepts_gzip = False
+        for item in request.headers.get("accept-encoding", "").split(","):
+            name, *parameters = item.strip().lower().split(";")
+            if name != "gzip":
+                continue
+            quality = 1.0
+            for parameter in parameters:
+                key, separator, value = parameter.strip().partition("=")
+                if key == "q" and separator:
+                    try:
+                        quality = float(value)
+                    except ValueError:
+                        quality = 0.0
+            accepts_gzip = quality > 0
+            break
+        response_headers = {
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "Vary": "Accept-Encoding",
+        }
+        if not accepts_gzip:
+            return JSONResponse(content=preview, headers=response_headers)
+        body = JSONResponse(content=preview).body
+        return Response(
+            content=gzip.compress(body, compresslevel=1, mtime=0),
+            media_type="application/json",
+            headers={
+                **response_headers,
+                "Content-Encoding": "gzip",
+            },
+        )
+    except (SignalPreviewUnavailable, StorageError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/recordings/{record_id}/original")
+def download_original(record_id: str, db: Session = Depends(get_session),
+                      current_user: User = Depends(require_owner_auth)):
+    from backend.app.services.source_download_service import original_response
+    from backend.app.services.storage_service import StorageError
+    record = _get_record(db, record_id, current_user.id)
+    session = get_session_by_database_id(db, record.session_db_id, current_user.id)
+    if not session or not record.original_artifact_path:
+        raise HTTPException(404, "Original recording is unavailable. Previously deleted originals cannot be recovered.")
+    storage = SessionStorage()
+    artifact = Path(record.original_artifact_path)
+    suffix = artifact.name.removesuffix(".enc").split(".")[-1]
+    if suffix not in {"e", "edf", "data"} or artifact != storage.root / session.session_id / "retained" / f"{record.record_id}.source.{suffix}.enc":
+        raise HTTPException(404, "Original recording is unavailable.")
+    _audit_record_access(db, current_user, record, "recording_download")
+    try:
+        return original_response(storage, session.session_id, artifact, f"{record.record_id}.{suffix}")
+    except (StorageError, FileNotFoundError):
+        raise HTTPException(404, "Original recording is unavailable.")
