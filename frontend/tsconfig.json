@@ -36,7 +36,9 @@
     ".next/dev/types/**/*.ts",
     ".next/dev/dev/types/**/*.ts",
     ".next-playback-check/types/**/*.ts",
-    ".next-playback-check/dev/types/**/*.ts"
+    ".next-playback-check/dev/types/**/*.ts",
+    ".next-vercel-check/types/**/*.ts",
+    ".next-vercel-check/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"
