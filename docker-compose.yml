@@ -119,7 +119,7 @@ services:
       - "127.0.0.1:8000:8000"
     user: "999:999"
     mem_limit: ${BACKEND_MEMORY_LIMIT:-4g}
-    cpus: ${BACKEND_CPU_LIMIT:-2.0}
+    cpus: ${BACKEND_CPU_LIMIT:-4.0}
     pids_limit: ${BACKEND_PIDS_LIMIT:-512}
     ulimits:
       nofile:

@@ -1025,3 +1025,114 @@ test("a failed facial expression step leaves the VSViG result intact", async ({
     page.getByText(/Facial expression analysis did not complete/),
   ).toBeVisible();
 });
+
+test("facial expression results show even when VSViG rejects the clip", async ({
+  page,
+}) => {
+  const labels = [
+    "angry",
+    "disgust",
+    "fear",
+    "happy",
+    "neutral",
+    "sad",
+    "surprise",
+  ] as const;
+  const emotion = {
+    status: "complete",
+    labels,
+    face_coverage: 0.64,
+    windows: 2,
+    windows_with_face: 2,
+    dominant_emotion_share: Object.fromEntries(
+      labels.map((l) => [l, l === "neutral" ? 1 : 0]),
+    ),
+    mean_probabilities: Object.fromEntries(labels.map((l) => [l, 1 / 7])),
+    model: { model: "OpenCV Zoo facial expression (MobileFaceNet)" },
+    settings: { roi: null, sample_fps: 2, window_sec: 1 },
+    validation_note: "Not validated on seizure video.",
+    timeline: {
+      start_sec: [0, 1],
+      end_sec: [1, 2],
+      face_coverage: [1, 1],
+      dominant_emotion: ["neutral", "neutral"],
+      dominant_probability: [0.6, 0.6],
+      probabilities: Object.fromEntries(labels.map((l) => [l, [0.1, 0.1]])),
+    },
+  };
+  let predictionRequests = 0;
+  await page.route("**/api/video-detection/jobs/VID-rejected", (route) =>
+    route.fulfill({
+      json: {
+        job: {
+          ...job,
+          job_id: "VID-rejected",
+          status: "failed",
+          current_stage: "privacy-review-ready",
+          emotion_status: "complete",
+          error:
+            "The opening five-second pose check found no track with all 15 required landmarks.",
+        },
+      },
+    }),
+  );
+  await page.route(
+    "**/api/video-detection/jobs/VID-rejected/predictions",
+    (route) => {
+      predictionRequests += 1;
+      return route.fulfill({ status: 409, json: { detail: "Not available." } });
+    },
+  );
+  await page.route(
+    "**/api/video-detection/jobs/VID-rejected/emotion",
+    (route) =>
+      route.fulfill({
+        json: emotion,
+        headers: {
+          "Access-Control-Allow-Origin": "http://127.0.0.1:3001",
+          "Access-Control-Allow-Credentials": "true",
+        },
+      }),
+  );
+  await page.goto("/video-detection/VID-rejected");
+  const panel = page.getByRole("region", {
+    name: "Visible facial expression over time",
+  });
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText("64%", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "VSViG score over time" }),
+  ).toHaveCount(0);
+  expect(predictionRequests).toBe(0);
+});
+
+test("facial expression shows its own progress while VSViG is still running", async ({
+  page,
+}) => {
+  await page.route("**/api/video-detection/jobs/VID-parallel", (route) =>
+    route.fulfill({
+      json: {
+        job: {
+          ...job,
+          job_id: "VID-parallel",
+          status: "processing",
+          current_stage: "pose-and-inference",
+          emotion_status: "processing",
+          video_available: false,
+        },
+      },
+    }),
+  );
+  await page.goto("/video-detection/VID-parallel");
+  const panel = page.getByRole("region", {
+    name: "Visible facial expression over time",
+  });
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText(/runs at the same time as VSViG/)).toBeVisible();
+  const steps = page.getByRole("list", {
+    name: "Video review processing steps",
+  });
+  await expect(
+    steps.getByText("Facial expression", { exact: true }),
+  ).toHaveCount(0);
+});

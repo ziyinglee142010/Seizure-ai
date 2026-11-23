@@ -94,6 +94,30 @@ class VideoStorage:
             self._validate_job_id(job_id), expected, "video.input", deadline=deadline
         )
 
+    def materialize_original_for_emotion(self, job_id: str, encrypted_path: Path) -> Path:
+        """Decrypt the original into the facial-expression worker's own area.
+
+        VSViG cleanup clears ``work`` as a whole, so the independent emotion
+        worker uses ``emotion-work`` and removes it with
+        :meth:`remove_emotion_work` after each run.
+        """
+
+        expected = self._artifact_path(job_id, "video.input.enc", "original")
+        self._require_canonical_path(encrypted_path, expected)
+        return self._storage.materialize_retained_artifact(
+            self._validate_job_id(job_id), expected, "emotion.input", area="emotion-work"
+        )
+
+    def emotion_work_dir(self, job_id: str) -> Path:
+        """Return the private plaintext directory for facial-expression output."""
+
+        return self._storage.directory(self._validate_job_id(job_id), "emotion-work")
+
+    def remove_emotion_work(self, job_id: str) -> None:
+        """Delete all facial-expression plaintext for one job."""
+
+        self._storage.remove_area(self._validate_job_id(job_id), "emotion-work")
+
     def output_path(self, job_id: str) -> Path:
         """Return the encrypted transformed-output path used internally."""
 

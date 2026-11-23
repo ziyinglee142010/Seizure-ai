@@ -12,12 +12,14 @@ import {
 } from "@/components/VideoProcessingStatus";
 import {
   getDetection,
+  getDetectionEmotion,
   getDetectionResults,
   uploadDetection,
   detectionVisualizationUrl,
   type DetectionJob,
   type DetectionResult,
   type DetectionTrackResult,
+  type EmotionResult,
   videoJobFailureMessage,
 } from "@/lib/video-detection";
 import { SyncedVideoReview } from "./SyncedVideoReview";
@@ -206,6 +208,7 @@ export function VideoDetectionJobScreen({
 }) {
   const [job, setJob] = useState<DetectionJob | null>(null);
   const [result, setResult] = useState<DetectionResult | null>(null);
+  const [emotion, setEmotion] = useState<EmotionResult | null>(null);
   const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [resultRetryKey, setResultRetryKey] = useState(0);
@@ -214,6 +217,9 @@ export function VideoDetectionJobScreen({
     const abort = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     let retryAttempt = 0;
+    let resultLoaded = false;
+    let emotionLoaded = false;
+    let emotionAttempts = 0;
 
     async function poll() {
       try {
@@ -221,10 +227,37 @@ export function VideoDetectionJobScreen({
         if (abort.signal.aborted) return;
 
         setJob(nextJob);
-        if (nextJob.status === "ready" && !nextJob.reference_only) {
+        // Facial expression is its own job: load it as soon as it finishes,
+        // whether VSViG is still running, has finished, or rejected the clip.
+        if (
+          !emotionLoaded &&
+          (nextJob.emotion_status === "complete" ||
+            nextJob.emotion_status === "failed")
+        ) {
+          try {
+            const nextEmotion = await getDetectionEmotion(jobId, abort.signal);
+            if (abort.signal.aborted) return;
+            setEmotion(nextEmotion);
+            emotionLoaded = true;
+          } catch {
+            // Retry on the next poll, then stop; a reload tries again. VSViG
+            // results are unaffected.
+            if (abort.signal.aborted) return;
+            emotionAttempts += 1;
+            if (emotionAttempts >= 3) emotionLoaded = true;
+          }
+        }
+        if (
+          nextJob.status === "ready" &&
+          !nextJob.reference_only &&
+          resultLoaded
+        ) {
+          retryAttempt = 0;
+        } else if (nextJob.status === "ready" && !nextJob.reference_only) {
           try {
             const nextResult = await getDetectionResults(jobId, abort.signal);
             if (abort.signal.aborted) return;
+            resultLoaded = true;
             setResult(nextResult);
             setError(null);
             retryAttempt = 0;
@@ -248,11 +281,18 @@ export function VideoDetectionJobScreen({
         setError(null);
 
         // Reference-only VEEG clips have their own playback-status polling in
-        // the synchronized review. VSViG jobs need polling only until inference
-        // reaches a terminal state; once ready, their result is immutable.
+        // the synchronized review. Analysis jobs poll until both independent
+        // lanes, VSViG and facial expression, reach a terminal state; once
+        // finished, each result is immutable.
+        const emotionPending =
+          nextJob.emotion_status === "queued" ||
+          nextJob.emotion_status === "processing" ||
+          ((nextJob.emotion_status === "complete" ||
+            nextJob.emotion_status === "failed") &&
+            !emotionLoaded);
         if (
           !nextJob.reference_only &&
-          ["queued", "processing"].includes(nextJob.status)
+          (["queued", "processing"].includes(nextJob.status) || emotionPending)
         ) {
           timer = setTimeout(poll, 1_500);
         }
@@ -561,9 +601,15 @@ export function VideoDetectionJobScreen({
                 {!!trackResult?.predictions.length && (
                   <WindowScores predictions={trackResult.predictions} />
                 )}
-                <VideoEmotionPanel emotion={result.emotion} />
                 <ModelDetails model={result.model} privacy={result.privacy} />
               </>
+            )}
+            {!job.reference_only && (
+              <VideoEmotionPanel
+                // Older jobs kept their emotion result inside the VSViG result.
+                emotion={emotion ?? result?.emotion}
+                status={job.emotion_status}
+              />
             )}
           </>
         )}

@@ -441,6 +441,10 @@ class VideoDetectionTests(unittest.TestCase):
         p.start(); self.addCleanup(p.stop)
         p = patch.object(service, "_run_pose_readiness", return_value=POSE_READY)
         p.start(); self.addCleanup(p.stop)
+        # Uploads start the independent emotion lane on a real thread pool;
+        # tests drive process_emotion_job directly instead.
+        p = patch.object(service, "enqueue_emotion")
+        self.enqueue_emotion = p.start(); self.addCleanup(p.stop)
         # No application lifespan: dependencies and database are fixture-scoped.
         self.alice, self.bob = TestClient(app), TestClient(app)
         self.addCleanup(self.alice.close); self.addCleanup(self.bob.close)
@@ -1139,6 +1143,74 @@ class VideoDetectionTests(unittest.TestCase):
             self.assertFalse((self.storage.root / job_id / "original").exists())
             self.assertFalse((self.storage.root / job_id / "work").exists())
 
+    def _seed_retained_rejected_job(self, db, error_code):
+        job_id = "VID-" + os.urandom(16).hex()
+        encrypted = asyncio.run(
+            self.storage.save_upload(
+                job_id,
+                UploadFile(
+                    filename="clip.mp4",
+                    file=io.BytesIO(b"private-source-bytes"),
+                    headers=Headers({"content-type": "video/mp4"}),
+                ),
+            )
+        )
+        job = VideoDetectionJob(
+            owner_user_id=self.owner,
+            job_id=job_id,
+            status="processing",
+            current_stage="privacy-review",
+            error_code=error_code,
+            original_path=str(encrypted),
+            fps=25,
+            duration_seconds=5,
+            retention_expires_at=None,
+        )
+        db.add(job)
+        db.commit()
+        return job_id
+
+    def test_retained_rejected_review_job_settles_and_keeps_its_rejection_reason(self):
+        with Session(self.engine) as db:
+            job_id = self._seed_retained_rejected_job(db, "video_resolution_mismatch")
+        info = {"fps": 25.0, "width": 640, "height": 480, "frame_count": 125}
+        with patch.object(service, "engine", self.engine), patch.object(
+            service, "VideoStorage", return_value=self.storage
+        ), patch.object(service, "CLINICAL_VIDEO_REVIEW_ENABLED", True), patch.object(
+            service.VideoPrivacyProcessor, "preflight", return_value=info
+        ), patch(
+            "backend.app.services.video_privacy_service.finalize_protected_video",
+            side_effect=lambda source, _visual, output: output.write_bytes(
+                source.read_bytes() + b"-h264"
+            ),
+        ), patch.object(service, "validate_visualization_artifact", return_value=125):
+            service.process_rejected_review_job(job_id)
+        with Session(self.engine) as db:
+            saved = db.exec(
+                select(VideoDetectionJob).where(VideoDetectionJob.job_id == job_id)
+            ).one()
+            self.assertEqual(saved.status, "failed")
+            self.assertEqual(saved.current_stage, "privacy-review-ready")
+            self.assertEqual(saved.error_code, "video_resolution_mismatch")
+            self.assertTrue(Path(saved.visualization_path or "").is_file())
+            self.assertTrue(Path(saved.original_path or "").is_file())
+
+    def test_retained_rejected_review_job_settles_when_review_is_unavailable(self):
+        with Session(self.engine) as db:
+            job_id = self._seed_retained_rejected_job(db, "pose_readiness_person_count")
+        with patch.object(service, "engine", self.engine), patch.object(
+            service, "VideoStorage", return_value=self.storage
+        ), patch.object(service, "CLINICAL_VIDEO_REVIEW_ENABLED", False):
+            service.process_rejected_review_job(job_id)
+        with Session(self.engine) as db:
+            saved = db.exec(
+                select(VideoDetectionJob).where(VideoDetectionJob.job_id == job_id)
+            ).one()
+            self.assertEqual(saved.status, "failed")
+            self.assertEqual(saved.current_stage, "privacy-review-failed")
+            self.assertEqual(saved.error_code, "pose_readiness_person_count")
+            self.assertIsNone(saved.visualization_path)
+
     def test_expiry_sweep_removes_visualization_and_predictions_without_a_visit(self):
         job_id = self.seed(with_visualization=True)
         with Session(self.engine) as db:
@@ -1748,6 +1820,164 @@ class VideoDetectionTests(unittest.TestCase):
             stored = db.exec(select(VideoDetectionJob)).one()
             self.assertEqual(stored.job_id, job["job_id"])
             self.assertTrue(Path(stored.original_path).is_file())
+
+    def test_rejected_upload_still_starts_the_independent_emotion_lane(self):
+        rejected = {**POSE_READY, "ready": False, "frames_with_incomplete_pose": 1,
+                    "missing_landmarks": {"left ankle": 1}}
+        with patch.object(service, "load_contract"), patch.object(
+            service,
+            "_preflight_uploaded_video",
+            return_value={"width": 1920, "height": 1080, "fps": 25.0,
+                          "frame_count": 125, "pose_readiness": rejected},
+        ), patch.object(service, "process_rejected_review_job"):
+            response = self.alice.post(
+                "/api/video-detection/jobs",
+                content=b"synthetic video bytes",
+                headers={**self.headers, "Content-Type": "application/octet-stream",
+                         "X-Video-Format": "mp4"},
+            )
+        self.assertEqual(response.status_code, 202, response.text)
+        job = response.json()["job"]
+        self.assertEqual(job["current_stage"], "privacy-review")
+        self.assertEqual(job["emotion_status"], "queued")
+        self.enqueue_emotion.assert_called_once_with(job["job_id"])
+
+    def test_disabled_emotion_lane_is_recorded_and_not_started(self):
+        rejected = {**POSE_READY, "ready": False, "frames_with_incomplete_pose": 1,
+                    "missing_landmarks": {"left ankle": 1}}
+        with patch.object(service, "load_contract"), patch.object(
+            service,
+            "_preflight_uploaded_video",
+            return_value={"width": 1920, "height": 1080, "fps": 25.0,
+                          "frame_count": 125, "pose_readiness": rejected},
+        ), patch.object(service, "process_rejected_review_job"), patch.object(
+            service, "EMOTION_RECOGNITION_ENABLED", False
+        ):
+            response = self.alice.post(
+                "/api/video-detection/jobs",
+                content=b"synthetic video bytes",
+                headers={**self.headers, "Content-Type": "application/octet-stream",
+                         "X-Video-Format": "mp4"},
+            )
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json()["job"]["emotion_status"], "disabled")
+        self.enqueue_emotion.assert_not_called()
+
+    def _seed_emotion_job(self, *, status="processing", stage="pose-and-inference"):
+        job_id = "VID-" + os.urandom(16).hex()
+        encrypted = asyncio.run(self.storage.save_upload(
+            job_id,
+            UploadFile(filename="clip.mp4", file=io.BytesIO(b"private-source-bytes"),
+                       headers=Headers({"content-type": "video/mp4"})),
+        ))
+        with Session(self.engine) as db:
+            db.add(VideoDetectionJob(
+                owner_user_id=self.owner, job_id=job_id, status=status,
+                current_stage=stage, original_path=str(encrypted), fps=25,
+                duration_seconds=5, retention_expires_at=None, emotion_status="queued",
+            ))
+            db.commit()
+        return job_id
+
+    def _stored(self, job_id):
+        with Session(self.engine) as db:
+            return db.exec(select(VideoDetectionJob).where(VideoDetectionJob.job_id == job_id)).one()
+
+    def test_emotion_lane_runs_alongside_vsvig_and_stores_an_encrypted_result(self):
+        from backend.tests.test_emotion_recognition import complete_emotion
+
+        job_id = self._seed_emotion_job()
+        vsvig_work = self.storage.work_path(job_id, "normalized-input.mp4")
+        vsvig_work.write_bytes(b"vsvig-plaintext-in-use")
+        seen = {}
+
+        def fake_emotion(source, seen_job_id, area, timeout):
+            seen["source"] = source.read_bytes()
+            seen["area"] = source.parent.name
+            area.work_path(seen_job_id, "emotion_summary.json").write_text("{}")
+            # VSViG finishes on its own worker while emotion is still running.
+            with Session(self.engine) as db:
+                row = db.exec(select(VideoDetectionJob).where(VideoDetectionJob.job_id == job_id)).one()
+                row.status, row.current_stage = "ready", "complete"
+                db.add(row); db.commit()
+            return complete_emotion()
+
+        with patch.object(service, "_run_emotion_recognition", side_effect=fake_emotion):
+            service.process_emotion_job(job_id)
+
+        self.assertEqual(seen, {"source": b"private-source-bytes", "area": "emotion-work"})
+        stored = self._stored(job_id)
+        self.assertEqual(stored.emotion_status, "complete")
+        self.assertEqual((stored.status, stored.current_stage), ("ready", "complete"))
+        self.assertNotIn(b"neutral", stored.emotion_ciphertext)
+        self.assertEqual(service.read_encrypted_emotion_result(stored)["status"], "complete")
+        self.assertIsNone(service.read_encrypted_video_result(stored))
+        self.assertFalse((self.storage.root / job_id / "emotion-work").exists())
+        self.assertEqual(vsvig_work.read_bytes(), b"vsvig-plaintext-in-use")
+        self.assertTrue(Path(stored.original_path).is_file())
+
+        response = self.alice.get(f"/api/video-detection/jobs/{job_id}/emotion", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["timeline"]["dominant_emotion"], ["neutral", "no_face"])
+        self.assertNotIn("input", response.json())
+        self.assertIn("no-store", response.headers.get("cache-control", ""))
+        self.assertEqual(
+            self.bob.get(f"/api/video-detection/jobs/{job_id}/emotion", headers=self.headers).status_code,
+            404,
+        )
+        detail = self.alice.get(f"/api/video-detection/jobs/{job_id}", headers=self.headers).json()["job"]
+        self.assertEqual(detail["emotion_status"], "complete")
+
+    def test_emotion_result_is_bound_to_its_own_purpose(self):
+        job_id = self._seed_emotion_job()
+        with patch.object(service, "_run_emotion_recognition", return_value={"status": "disabled"}):
+            service.process_emotion_job(job_id)
+        stored = self._stored(job_id)
+        stored.result_nonce, stored.result_ciphertext = stored.emotion_nonce, stored.emotion_ciphertext
+        with self.assertRaises(DetectionError):
+            service.read_encrypted_video_result(stored)
+
+    def test_emotion_lane_runs_once_and_reports_failure_without_plaintext(self):
+        job_id = self._seed_emotion_job(status="failed", stage="privacy-review-ready")
+        with patch.object(service, "_run_emotion_recognition", side_effect=RuntimeError("boom")) as run:
+            service.process_emotion_job(job_id)
+            service.process_emotion_job(job_id)   # already claimed: no second run
+        run.assert_called_once()
+        stored = self._stored(job_id)
+        self.assertEqual(stored.emotion_status, "failed")
+        self.assertEqual(stored.status, "failed")
+        self.assertFalse((self.storage.root / job_id / "emotion-work").exists())
+        response = self.alice.get(f"/api/video-detection/jobs/{job_id}/emotion", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"status": "failed", "error_code": "emotion_failed"})
+
+    def test_emotion_endpoint_waits_for_a_result(self):
+        job_id = self._seed_emotion_job()
+        response = self.alice.get(f"/api/video-detection/jobs/{job_id}/emotion", headers=self.headers)
+        self.assertEqual(response.status_code, 409, response.text)
+
+    def test_startup_sweep_requeues_interrupted_emotion_and_removes_its_plaintext(self):
+        job_id = self._seed_emotion_job(status="failed", stage="privacy-review-ready")
+        leftover = self.storage.emotion_work_dir(job_id) / "emotion.input"
+        leftover.write_bytes(b"interrupted-plaintext")
+        with Session(self.engine) as db:
+            row = db.exec(select(VideoDetectionJob).where(VideoDetectionJob.job_id == job_id)).one()
+            row.emotion_status = "processing"
+            db.add(row); db.commit()
+        service.sweep(startup=True)
+        self.assertFalse(leftover.parent.exists())
+        self.assertEqual(self._stored(job_id).emotion_status, "queued")
+        self.enqueue_emotion.assert_called_once_with(job_id)
+
+    def test_legacy_emotion_inside_the_vsvig_result_is_still_served(self):
+        from backend.tests.test_emotion_recognition import complete_emotion
+
+        job_id = self.seed(prediction_overrides={"emotion": complete_emotion()})
+        response = self.alice.get(f"/api/video-detection/jobs/{job_id}/emotion", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "complete")
+        self.assertEqual(self._stored(job_id).emotion_status, "not_applicable")
+        self.assertEqual(list((self.storage.root / job_id / "work").glob("scores-*")), [])
 
     def test_legacy_avi_upload_is_accepted_by_preflight(self):
         with patch.object(service, "load_contract", return_value=(Path(self.temp.name), {})), patch.object(

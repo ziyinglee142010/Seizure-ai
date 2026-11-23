@@ -7,7 +7,7 @@ This build combines four pieces into one application, using MDS01 (`4ffaad/eeg-v
 | EEG review, accounts, encrypted storage, reports | MDS01 | whole app | — |
 | **EEG seizure detection** | FYP-MCS18 SeizureTransformer | EEG analysis | per-window seizure score + flagged windows |
 | **Video seizure detection** | MDS01 VSViG | video analysis | per-window VSViG score |
-| **Facial emotion recognition** | AI-vEEG Phase 2 (this project) | video analysis, after VSViG | per-second facial expression |
+| **Facial emotion recognition** | AI-vEEG Phase 2 (this project) | video analysis, independent of VSViG (runs at the same time) | per-second facial expression |
 
 MDS01's original H5 EEG model is kept in the code as a legacy option (`--research-h5`) but is not used by default.
 
@@ -33,7 +33,7 @@ Without Docker, `docker-compose.seizure-transformer.yml` lists the settings to c
 The signal processing is ported from MCS18 `web-app/backend/app/seizure_detection.py` without changes, and `model.py` is copied byte for byte. On the same input, MDS01 and MCS18 gave identical probabilities (maximum difference 0.0) and identical event masks.
 
 **Input.** The 19 single 10-20 electrodes FP1, F3, C3, P3, O1, F7, T7, P7, FZ, CZ, PZ, FP2, F4, C4, P4, O2, F8, T8 and P8. The old names T3, T4, T5 and T6 are accepted, and so are labels such as `EEG FP1-REF` and `Fp1-LE`. The electrodes are read from:
-- EDF files with single-electrode (referential) channels;
+- EDF files with single-electrode (referential) channels, at any single sampling rate (for example 200, 250, 256, 500 or 512 Hz). The model's own step 3 below resamples to 256 Hz. With this model, an EDF is not held to the legacy H5 model's exact-256 Hz rule; that rule still applies when the H5 model is selected;
 - Nicolet `.data`/`.head`;
 - legacy Nicolet `.e` files, read straight from the source at 500 Hz.
 
@@ -65,7 +65,9 @@ This is MDS01's own pipeline, unchanged except for one fix. The pose network wei
 
 ## Facial emotion recognition
 
-After VSViG finishes, the same uploaded video goes to an isolated worker process (`python -m backend.app.emotion_recognition`). The worker runs these steps:
+Emotion recognition is a separate job from VSViG. It starts as soon as a video upload is stored and runs at the same time as VSViG, on its own worker. It does **not** depend on VSViG: it also runs on clips that VSViG rejects (for example a clip that fails the opening pose check or is not 1920×1080), and VSViG does not wait for it. One emotion run happens at a time; the backend container's default CPU limit is 4 so the two lanes do not slow each other down (`BACKEND_CPU_LIMIT`).
+
+Each run decrypts the original into its own temporary area (`emotion-work`), separate from VSViG's work area, and sends it to an isolated worker process (`python -m backend.app.emotion_recognition`). The worker runs these steps:
 1. Detect faces with YuNet at 4 rotations, so faces lying sideways are still found.
 2. Choose the patient as the face that stays in place within each 10-second segment, then follow it.
 3. Align the face to a 112×112 crop using its 5 landmarks.
@@ -80,11 +82,15 @@ The results page shows:
 
 **Privacy.** These rules match MDS01's VSViG rules:
 - no face images are written anywhere;
-- the worker's output files are deleted after they are read;
-- the per-second scores are stored encrypted inside the job result, which only its owner can open;
+- the decrypted copy and the worker's output files are deleted after each run, and any left by an interrupted run are deleted when the backend restarts;
+- the per-second scores are stored encrypted in the database, in their own field bound to the job and its owner, and only the owner can open them (`GET /api/video-detection/jobs/{job_id}/emotion`);
 - the API returns only fields on an allowlist, with every label and range checked.
 
-**If it fails.** A failure in this step never affects the VSViG result. The page then reports that the facial expression step did not complete.
+Because emotion recognition runs on every uploaded analysis clip, faces in clips that VSViG rejects are now analysed as well, and the face detector also sees anyone else in frame (it then follows the face that stays in place). Confirm this is covered by your project's approval before using real patient video.
+
+**Status.** Each analysis job reports `emotion_status`: `queued`, `processing`, `complete`, `failed`, `disabled` (turned off in settings), `unavailable` (no retained source), or `not_applicable` (reference clips and jobs from before this change). Jobs from before this change keep their emotion result inside the VSViG result, and the emotion endpoint still serves it. Deleting a case waits until any emotion run in it has finished.
+
+**If it fails.** A failure in this step never affects the VSViG result, and a VSViG failure never stops this step. The page reports each one separately.
 
 **Settings** (`.env`):
 
@@ -103,8 +109,9 @@ The results page shows:
 | SeizureTransformer | `backend/app/ml/seizure_transformer/`, `backend/app/ml/seizure_transformer_inference.py` |
 | Electrode reading | `backend/app/eeg/electrodes.py`, `LegacyNicoletReader.read_electrode_segments` |
 | Emotion module | `backend/app/emotion_recognition/` |
-| Emotion step in the video job | `backend/app/services/video_detection_service.py` (`_run_emotion_recognition`) |
-| Public emotion fields | `backend/app/api/video_detection.py` (`_public_emotion_result`) |
+| Emotion job lane | `backend/app/services/video_detection_service.py` (`process_emotion_job`, `_run_emotion_recognition`) |
+| Public emotion fields and endpoint | `backend/app/api/video_detection.py` (`_public_emotion_result`, `GET /jobs/{job_id}/emotion`) |
+| Emotion columns | `backend/migrations/versions/038_independent_emotion.py` |
 | Results panel | `frontend/src/components/VideoEmotionPanel.tsx` |
 | Pose speed fix | `backend/app/video_detection/runtime.py` (`_zero_denormal_weights`) |
 | Launcher and Compose | `scripts/demo.mjs`, `docker-compose.seizure-transformer.yml` |

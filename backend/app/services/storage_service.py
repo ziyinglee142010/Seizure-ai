@@ -172,8 +172,11 @@ class SessionStorage:
         session_id : str
             Opaque session identifier.
         name : str
-            One of ``original``, ``work``, ``extracted``, ``deidentified``,
-            ``processed``, ``retained``, or ``explanations``.
+            One of ``original``, ``work``, ``emotion-work``, ``extracted``,
+            ``deidentified``, ``processed``, ``retained``, or ``explanations``.
+            ``emotion-work`` is a separate plaintext area for the independent
+            facial-expression worker; session cleanup of ``work`` leaves it to
+            that worker, which removes it after each run.
 
         Returns
         -------
@@ -186,7 +189,7 @@ class SessionStorage:
             Raised for unknown artifact categories.
         """
 
-        if name not in {"original", "work", "extracted", "deidentified", "processed", "retained", "explanations"}:
+        if name not in {"original", "work", "emotion-work", "extracted", "deidentified", "processed", "retained", "explanations"}:
             raise StorageError("Unknown session storage area.")
         path = self.session_dir(session_id) / name
         if path.is_symlink() or (path.exists() and not path.is_dir()):
@@ -564,14 +567,22 @@ class SessionStorage:
         return self._materialize_encrypted(safe_path, destination, deadline=deadline)
 
     def materialize_retained_artifact(
-        self, session_id: str, encrypted_path: Path, name: str, *, deadline: float | None = None
+        self,
+        session_id: str,
+        encrypted_path: Path,
+        name: str,
+        *,
+        deadline: float | None = None,
+        area: str = "work",
     ) -> Path:
         """Decrypt one retained artifact into temporary private work storage."""
 
         if Path(name).name != name or not name:
             raise StorageError("Retained artifact name is invalid.")
+        if area not in {"work", "emotion-work"}:
+            raise StorageError("Unknown session storage area.")
         safe_path = self._validate_materialization_source(session_id, encrypted_path)
-        destination = self.directory(session_id, "work") / name
+        destination = self.directory(session_id, area) / name
         return self._materialize_encrypted(safe_path, destination, deadline=deadline)
 
     def _validate_materialization_source(self, session_id: str, encrypted_path: Path) -> Path:
@@ -1157,6 +1168,16 @@ class SessionStorage:
             raise StorageError("Private storage cleanup failed.") from exc
         if path.exists():
             raise StorageError("Private storage cleanup could not be verified.")
+
+    def remove_area(self, session_id: str, name: str) -> None:
+        """Remove one transient plaintext area, leaving every other area intact."""
+
+        if name not in {"work", "emotion-work"}:
+            raise StorageError("Unknown session storage area.")
+        area = self.root / self._safe_session_id(session_id) / name
+        if area.is_symlink():
+            raise StorageError("Session storage area is invalid.")
+        self._remove_tree(area)
 
     def delete_retained_artifact(self, path: Path) -> None:
         """Delete one encrypted retained artifact after a recording failure.

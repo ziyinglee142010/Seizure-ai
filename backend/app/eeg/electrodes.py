@@ -128,12 +128,14 @@ def derive_bipolar_montage(signals: np.ndarray, labels: list[str]) -> tuple[np.n
     return out, list(MODEL_CHANNELS)
 
 
-def read_electrode_segments(path: str | Path) -> tuple[list[tuple[float, np.ndarray]], int]:
+def read_electrode_segments(path: str | Path) -> tuple[list[tuple[float, np.ndarray]], int | float]:
     """Read the 19 electrodes as contiguous segments ``[(start_seconds, (19, n))]``.
 
-    The sampling rate is the file's own; the model pipeline resamples.
+    The sampling rate is the file's own; the model pipeline resamples. EDF is
+    therefore read without the H5 contract's exact-256 Hz rule.
     """
 
+    from backend.app.eeg.edf_io import read_uniform_edf
     from backend.app.eeg.io import detect_eeg_format, read_uniform_eeg
 
     candidate = Path(path)
@@ -143,5 +145,9 @@ def read_electrode_segments(path: str | Path) -> tuple[list[tuple[float, np.ndar
 
         segments, rate = LegacyNicoletReader(candidate).read_electrode_segments(SEIZURE_TRANSFORMER_ELECTRODES)
         return segments, rate
-    signals, rate, labels = read_uniform_eeg(candidate)   # EDF is continuous; .data has no gaps
-    return [(0.0, select_electrodes(signals, list(labels)))], int(rate)
+    if eeg_format == "edf":
+        # EDF+D is rejected by the reader, so an EDF is one contiguous segment.
+        signals, rate, labels = read_uniform_edf(candidate, require_model_rate=False)
+    else:
+        signals, rate, labels = read_uniform_eeg(candidate)   # .data has no gaps
+    return [(0.0, select_electrodes(signals, list(labels)))], rate

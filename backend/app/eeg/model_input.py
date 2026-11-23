@@ -359,6 +359,25 @@ def preprocess_eeg(
     }
 
 
+def window_start_grid(duration_seconds: float) -> np.ndarray:
+    """Return the MDS01 window starts for one contiguous recording.
+
+    This is the same 4-second window, 2-second stride grid that
+    :func:`preprocess_eeg` produces for a contiguous recording at the model
+    rate, computed from duration alone. Runtimes that score source electrodes
+    at their native rate (SeizureTransformer) use it to place predictions
+    without building the 256 Hz bipolar H5 tensors.
+    """
+
+    if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        raise ValueError("EEG does not contain a full 4-second model window.")
+    total_samples = int(math.floor(duration_seconds * MODEL_SAMPLING_RATE + 1e-6))
+    if total_samples < WINDOW_SAMPLES:
+        raise ValueError("EEG does not contain a full 4-second model window.")
+    count = (total_samples - WINDOW_SAMPLES) // WINDOW_STEP_SAMPLES + 1
+    return np.arange(count, dtype=np.float64) * WINDOW_STEP_SECONDS
+
+
 def preprocess_edf(edf_path: str | Path) -> tuple[np.ndarray, np.ndarray, dict]:
     """Backward-compatible EDF preprocessing wrapper."""
 

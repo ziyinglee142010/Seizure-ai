@@ -60,6 +60,19 @@ class VideoDetectionJob(SQLModel, table=True):
         default=None,
         sa_column=Column(LargeBinary, nullable=True),
     )
+    # Facial-expression analysis is an independent job lane: it starts at
+    # upload, runs alongside VSViG, and does not depend on VSViG admission.
+    # Statuses: not_applicable (reference or legacy rows), disabled, queued,
+    # processing, complete, failed, unavailable (no retained source).
+    emotion_status: str = Field(default="not_applicable", max_length=24)
+    emotion_nonce: bytes | None = Field(
+        default=None,
+        sa_column=Column(LargeBinary, nullable=True),
+    )
+    emotion_ciphertext: bytes | None = Field(
+        default=None,
+        sa_column=Column(LargeBinary, nullable=True),
+    )
     error_code: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     retention_expires_at: datetime | None = None

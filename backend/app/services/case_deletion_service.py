@@ -123,6 +123,7 @@ def delete_case(
         any(session.status in _ACTIVE_EEG_STATUSES for session in sessions)
         or any(job.status not in _TERMINAL_DETECTION_STATUSES for job in detection_jobs)
         or any(job.playback_status == "processing" for job in detection_jobs)
+        or any(job.emotion_status in {"queued", "processing"} for job in detection_jobs)
         or any(job.status not in _TERMINAL_PRIVACY_STATUSES for job in privacy_jobs)
     ):
         raise CaseDeletionInProgress

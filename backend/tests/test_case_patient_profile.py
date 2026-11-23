@@ -575,9 +575,22 @@ class PatientProfileApiTests(unittest.TestCase):
         )
         self.assertEqual(active_detection.status_code, 409, active_detection.text)
 
+        # The independent facial-expression lane also blocks deletion while
+        # it may still be reading the encrypted source.
         with Session(self.engine) as db:
             detection = db.exec(select(VideoDetectionJob)).one()
             detection.status = "ready"
+            detection.emotion_status = "processing"
+            db.add(detection)
+            db.commit()
+        active_emotion = self.client.delete(
+            f"/api/cases/{self.case_id}", headers=headers
+        )
+        self.assertEqual(active_emotion.status_code, 409, active_emotion.text)
+
+        with Session(self.engine) as db:
+            detection = db.exec(select(VideoDetectionJob)).one()
+            detection.emotion_status = "complete"
             db.add(detection)
             db.add(
                 VideoPrivacyJob(

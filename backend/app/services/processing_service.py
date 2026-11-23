@@ -47,7 +47,8 @@ from backend.app.core.config import (
 from backend.app.eeg.io import read_legacy_eeg_video_sync
 from backend.app.eeg.legacy_nicolet import LegacyNicoletReader, validate_legacy_nicolet
 from backend.app.eeg.electrodes import ModelInputUnavailable, read_electrode_segments
-from backend.app.eeg.model_input import preprocess_edf, preprocess_eeg
+from backend.app.eeg.contracts import MODEL_SAMPLING_RATE
+from backend.app.eeg.model_input import preprocess_edf, preprocess_eeg, window_start_grid
 from backend.app.ml.interface import InferenceService, WindowPrediction
 from backend.app.ml.model_loader import get_inference_service
 from backend.app.ml.shap_explanation import ShapExplanationError, build_shap_explanations
@@ -680,9 +681,17 @@ def _process_record(
         ))
         db.add(record)
         db.commit()
-    technical = validate_edf(extracted_path) if extracted_path.suffix.lower() == ".edf" else validate_eeg(extracted_path)
+    # SeizureTransformer reads source electrodes at the file's own rate and
+    # resamples inside its reviewed pipeline, so its EDF input is not held to
+    # the H5 contract's exact 256 Hz. H5 and Nicolet .data keep that rule.
+    electrode_input = bool(getattr(inference, "requires_electrode_input", False))
+    technical = (
+        validate_edf(extracted_path, require_model_rate=not electrode_input)
+        if extracted_path.suffix.lower() == ".edf"
+        else validate_eeg(extracted_path)
+    )
     record.duration_seconds = technical["duration_seconds"]
-    record.sampling_rate = technical["sampling_rate"]
+    record.sampling_rate = int(round(float(technical["sampling_rate"])))
     record.channel_count = technical["channel_count"]
     record.source_format = technical.get(
         "format",
@@ -718,7 +727,17 @@ def _process_record(
     _set_session_status(db, session, AnalysisStatus.PREPROCESSING, "preprocessing")
     prep_attempt = _begin_attempt(db, session, ProcessingStage.PREPROCESSING, record)
     try:
-        if extracted_path.suffix.lower() == ".edf":
+        if (
+            extracted_path.suffix.lower() == ".edf"
+            and electrode_input
+            and float(technical["sampling_rate"]) != MODEL_SAMPLING_RATE
+        ):
+            # The 256 Hz bipolar H5 tensors cannot be built without an approved
+            # resampling step, and SeizureTransformer does not use them. Place
+            # its predictions on the same window grid from the duration alone.
+            windows = None
+            starts = window_start_grid(float(technical["duration_seconds"]))
+        elif extracted_path.suffix.lower() == ".edf":
             windows, starts, _details = preprocess_edf(str(deid_path))
         elif extracted_path.suffix.lower() == ".e":
             model_segments = (
@@ -763,9 +782,9 @@ def _process_record(
     try:
         model_windows = windows
         obfuscate = SIGNAL_OBFUSCATION in methods_from_profile(session.privacy_method)
-        if obfuscate:
+        if obfuscate and not electrode_input:
             model_windows = obfuscate_signal(windows, read_base64_key(TEMPLATE_KEY_ENV))
-        if getattr(inference, "requires_electrode_input", False):
+        if electrode_input:
             # SeizureTransformer scores single electrodes, not the bipolar
             # windows. Only signal values are read: the de-identified EDF, or
             # for legacy Nicolet the .e source, whose de-identified copy holds
@@ -925,7 +944,7 @@ def _retain_positive_artifact(
     record: EEGRecording,
     storage: SessionStorage,
     source_path: Path,
-    model_windows: np.ndarray,
+    model_windows: np.ndarray | None,
     window_starts: np.ndarray,
     predictions: list[WindowPrediction],
     has_time_gaps: bool = False,
@@ -957,6 +976,10 @@ def _retain_positive_artifact(
     """
 
     if session.retention_policy == "until-deletion" and record.original_artifact_path:
+        return None
+    if model_windows is None:
+        # Native-rate SeizureTransformer input has no 256 Hz bipolar windows to
+        # clip; historical clip-only retention is unavailable for it.
         return None
     alert_intervals = detected_intervals(
         predictions,

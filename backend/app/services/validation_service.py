@@ -54,7 +54,7 @@ def validate_eeg(path: Path) -> dict:
     raise ValidationError(unsupported_eeg_format_message(path))
 
 
-def validate_edf(path: Path) -> dict:
+def validate_edf(path: Path, *, require_model_rate: bool = True) -> dict:
     """Validate an EDF and return safe technical metadata.
 
     Parameters
@@ -62,6 +62,9 @@ def validate_edf(path: Path) -> dict:
     path : pathlib.Path
         EDF file to inspect. Only technical headers and sample counts are read;
         patient-identifying values are neither returned nor logged.
+    require_model_rate : bool
+        Require the H5 contract's exact 256 Hz input. False only for runtimes
+        that resample in their own reviewed pipeline (SeizureTransformer).
 
     Returns
     -------
@@ -83,7 +86,9 @@ def validate_edf(path: Path) -> dict:
         sample_counts = reader.getNSamples()
         if not labels or not len(frequencies) or not len(sample_counts):
             raise ValidationError("EDF file does not contain EEG signal data.")
-        sampling_rate = validated_edf_sampling_rate(frequencies)
+        sampling_rate = validated_edf_sampling_rate(
+            frequencies, require_model_rate=require_model_rate
+        )
         if len(set(sample_counts.tolist())) != 1:
             raise ValidationError("EDF channels must use one sample count.")
         if int(sample_counts[0]) <= 0:

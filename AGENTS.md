@@ -21,6 +21,9 @@ combined VEEG video upload → encrypt original → acknowledge upload
 standalone VSViG upload → encrypted original → pose-readiness gate → queue
   → transient normalized frames → OpenPose tracks + 15 RGB patches
   → VSViG predictions + encrypted review artifacts
+  (in parallel, independent of the pose gate) → emotion lane
+  → transient emotion-work copy → per-second expression scores
+  → encrypted emotion result in PostgreSQL
 ```
 
 FastAPI routes must remain thin. Business logic belongs in services,
@@ -176,6 +179,7 @@ GET  /api/video-detection/jobs
 GET  /api/video-detection/jobs/{job_id}
 GET  /api/video-detection/jobs/{job_id}/visualization
 GET  /api/video-detection/jobs/{job_id}/predictions
+GET  /api/video-detection/jobs/{job_id}/emotion
 ```
 
 The old `/api/v1` prototype routes have been removed. EEG changes use the

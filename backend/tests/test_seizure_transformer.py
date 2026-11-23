@@ -60,13 +60,13 @@ SOURCE_LABELS = (
 )
 
 
-def write_edf(path: Path, labels, seconds: int, *, seed: int = 0) -> np.ndarray:
-    """EDF with identifying header text, at 256 Hz, digital samples returned."""
+def write_edf(path: Path, labels, seconds: int, *, seed: int = 0, rate: int = 256) -> np.ndarray:
+    """EDF with identifying header text, at ``rate`` Hz, digital samples returned."""
 
     rng = np.random.default_rng(seed)
-    samples = rng.integers(-1500, 1500, size=(len(labels), 256 * seconds), dtype=np.int32)
+    samples = rng.integers(-1500, 1500, size=(len(labels), rate * seconds), dtype=np.int32)
     headers = [{
-        "label": label, "dimension": "uV", "sample_frequency": 256,
+        "label": label, "dimension": "uV", "sample_frequency": rate,
         "physical_min": -1000, "physical_max": 1000, "digital_min": -2048, "digital_max": 2047,
         "prefilter": "", "transducer": "",
     } for label in labels]
@@ -243,11 +243,11 @@ class ReferentialEdfTests(unittest.TestCase):
 class FullPipelineTests(unittest.TestCase):
     storage_key = b"s" * 32
 
-    def _process(self, root: Path, labels, session_id: str, value: float):
+    def _process(self, root: Path, labels, session_id: str, value: float, rate: int = 256, service=None):
         from backend.app.services.processing_service import process_session
 
         source = root / "recording.edf"
-        write_edf(source, labels, 70)
+        write_edf(source, labels, 70, rate=rate)
         archive = root / "session.zip"
         with zipfile.ZipFile(archive, "w") as output:
             output.write(source, source.name)
@@ -261,7 +261,7 @@ class FullPipelineTests(unittest.TestCase):
             db.add(EEGSession(session_id=session_id, privacy_method="metadata-scrub",
                               original_filename="session.zip", original_path=str(encrypted)))
             db.commit()
-        service = SeizureTransformerService(None, network=ConstantNet(value))
+        service = service or SeizureTransformerService(None, network=ConstantNet(value))
         with (
             patch("backend.app.services.processing_service.engine", database),
             patch("backend.app.services.processing_service.SessionStorage", return_value=storage),
@@ -283,6 +283,44 @@ class FullPipelineTests(unittest.TestCase):
                 self.assertEqual({p.model_name for p in predictions}, {"seizure-transformer-mcs18"})
                 self.assertAlmostEqual(predictions[0].probability, 0.9, places=5)
 
+    def test_referential_edf_at_other_rates_is_scored_on_the_same_grid(self) -> None:
+        for rate in (500, 250):
+            with self.subTest(rate=rate), tempfile.TemporaryDirectory() as directory:
+                session_id = f"SES-ST-{rate}"
+                database = self._process(Path(directory), SOURCE_LABELS, session_id, 0.9, rate=rate)
+                with Session(database) as db:
+                    session = get_session_by_public_id(db, session_id)
+                    record = list_recordings_for_session(db, session.id)[0]
+                    predictions = list_predictions(db, record.id)
+                    self.assertIsNone(record.error_message)
+                    self.assertEqual(session.status, AnalysisStatus.COMPLETED)
+                    self.assertEqual(record.sampling_rate, rate)
+                    self.assertEqual(len(predictions), 34)    # same grid as 256 Hz
+                    self.assertAlmostEqual(predictions[0].probability, 0.9, places=5)
+                    self.assertEqual(
+                        sorted(p.window_index for p in predictions), list(range(34))
+                    )
+
+    def test_h5_contract_still_requires_256_hz_edf(self) -> None:
+        class BipolarOnlyService:
+            """Stands in for the H5 runtime: no electrode input, never called."""
+
+            model_name, model_version, threshold = "h5-stand-in", "test", 0.5
+
+            def predict(self, *args, **kwargs):
+                raise AssertionError("H5 inference must not run on a 500 Hz EDF")
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._process(
+                Path(directory), MODEL_CHANNELS, "SES-H5-500", 0.9,
+                rate=500, service=BipolarOnlyService(),
+            )
+            with Session(database) as db:
+                session = get_session_by_public_id(db, "SES-H5-500")
+                record = list_recordings_for_session(db, session.id)[0]
+                self.assertIn("exactly 256 Hz", record.error_message or "")
+                self.assertEqual(list_predictions(db, record.id), [])
+
     def test_bipolar_only_edf_fails_with_a_message_the_user_can_act_on(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = self._process(Path(directory), MODEL_CHANNELS, "SES-BIPOLAR", 0.9)
@@ -291,6 +329,33 @@ class FullPipelineTests(unittest.TestCase):
                 record = list_recordings_for_session(db, session.id)[0]
                 self.assertIn("only bipolar pairs", record.error_message or "")
                 self.assertEqual(list_predictions(db, record.id), [])
+
+
+class WindowGridTests(unittest.TestCase):
+    def test_duration_grid_matches_the_256_hz_preprocessing_grid(self) -> None:
+        from backend.app.eeg.model_input import preprocess_eeg, window_start_grid
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bipolar.edf"
+            write_edf(source, MODEL_CHANNELS, 23)
+            _windows, starts, _details = preprocess_eeg(source)
+        np.testing.assert_array_equal(window_start_grid(23.0), starts)
+
+    def test_recordings_shorter_than_one_window_are_rejected(self) -> None:
+        from backend.app.eeg.model_input import window_start_grid
+
+        with self.assertRaisesRegex(ValueError, "full 4-second model window"):
+            window_start_grid(3.9)
+
+    def test_validation_keeps_256_hz_by_default_and_relaxes_it_on_request(self) -> None:
+        from backend.app.services.validation_service import ValidationError, validate_edf
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "rate500.edf"
+            write_edf(source, SOURCE_LABELS, 6, rate=500)
+            with self.assertRaisesRegex(ValidationError, "exactly 256 Hz"):
+                validate_edf(source)
+            self.assertEqual(validate_edf(source, require_model_rate=False)["sampling_rate"], 500)
 
 
 class LegacyNicoletElectrodeTests(unittest.TestCase):

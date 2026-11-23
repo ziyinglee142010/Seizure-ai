@@ -569,6 +569,10 @@ async def create(
                     source_group_id=source_group_id,
                     reference_only=False,
                 )
+        if not job.reference_only and service.start_emotion_lane(db, job):
+            # Facial expression starts now, in parallel with VSViG or the
+            # review-copy task, whatever the VSViG admission outcome.
+            service.enqueue_emotion(job.job_id)
         if job.reference_only and job.playback_status == "metadata_pending":
             service.enqueue_reference_metadata(job.job_id)
         elif job.status == "queued":
@@ -766,6 +770,45 @@ def predictions(job_id: str, current_user: User = Depends(account), db: Session 
     finally:
         if path:
             storage.delete_work_file(path)
+
+
+@router.get("/jobs/{job_id}/emotion")
+def emotion(job_id: str, current_user: User = Depends(account), db: Session = Depends(get_session)):
+    """Return the owner's facial-expression result, independent of VSViG."""
+
+    storage = VideoStorage()
+    job = owned(job_id, scoped_owner(current_user), db, storage)
+    path = None
+    try:
+        result = service.read_encrypted_emotion_result(job)
+        if result is None and job.status == "ready" and (job.result_ciphertext or job.predictions_path):
+            # Jobs from before the independent emotion lane kept their emotion
+            # result inside the VSViG result payload (database or legacy file).
+            legacy = service.read_encrypted_video_result(job)
+            if legacy is None:
+                path = storage.materialize_artifact(
+                    job_id, Path(job.predictions_path), f"scores-{secrets.token_hex(16)}.json"
+                )
+                legacy = json.loads(path.read_text())
+            result = legacy.get("emotion") if isinstance(legacy, dict) else None
+    except Exception as exc:
+        raise HTTPException(409, "Facial expression results are unavailable.") from exc
+    finally:
+        if path:
+            storage.delete_work_file(path)
+    if result is None:
+        raise HTTPException(409, "Facial expression results are not available.")
+    if job.id is not None:
+        record_clinical_access(
+            db,
+            actor_user_id=current_user.id,
+            video_job_db_id=job.id,
+            action="video_result_view",
+        )
+    try:
+        return _public_emotion_result(result)
+    except ValueError as exc:
+        raise HTTPException(409, "Facial expression results are unavailable.") from exc
 
 
 @router.post("/jobs/{job_id}/playback", status_code=202)

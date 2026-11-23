@@ -110,9 +110,20 @@ export interface DetectionJob {
     | "unavailable";
   video_available: boolean;
   error: string | null;
+  /** Independent facial-expression lane; runs alongside VSViG. Absent on older servers. */
+  emotion_status?: EmotionStatus;
   review_warning?: string | null;
   sync?: VideoEegSync;
 }
+
+export type EmotionStatus =
+  | "not_applicable"
+  | "disabled"
+  | "queued"
+  | "processing"
+  | "complete"
+  | "failed"
+  | "unavailable";
 
 export function videoJobFailureMessage(
   status: "failed" | "expired",
@@ -438,6 +449,11 @@ export const prepareReferencePlayback = (id: string, signal?: AbortSignal) =>
 export const getDetectionResults = (id: string, signal?: AbortSignal) =>
   getJson<DetectionResult>(
     `/api/video-detection/jobs/${encodeURIComponent(id)}/predictions`,
+    signal,
+  );
+export const getDetectionEmotion = (id: string, signal?: AbortSignal) =>
+  getJson<EmotionResult>(
+    `/api/video-detection/jobs/${encodeURIComponent(id)}/emotion`,
     signal,
   );
 export const detectionVisualizationUrl = (id: string) =>

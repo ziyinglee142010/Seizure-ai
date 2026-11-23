@@ -6,12 +6,7 @@ import { Icon } from "@/components/Icon";
 import type { DetectionJob } from "@/lib/video-detection";
 
 type StageIcon = "video" | "shield" | "activity" | "list";
-type StageId =
-  | "queued"
-  | "normalization"
-  | "pose-and-inference"
-  | "emotion-recognition"
-  | "complete";
+type StageId = "queued" | "normalization" | "pose-and-inference" | "complete";
 
 type StageDefinition = {
   id: StageId;
@@ -44,14 +39,6 @@ const stages: StageDefinition[] = [
       "Extract the 15 configured RGB patches and pose points, then score them.",
     icon: "activity",
     checkpoint: 72,
-  },
-  {
-    id: "emotion-recognition",
-    label: "Facial expression",
-    detail:
-      "Read the visible facial expression each second; VSViG scores are unchanged.",
-    icon: "activity",
-    checkpoint: 88,
   },
   {
     id: "complete",

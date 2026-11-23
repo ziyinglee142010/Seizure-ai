@@ -13,7 +13,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_CONFIG = REPOSITORY_ROOT / "backend" / "alembic.ini"
-EXPECTED_HEAD = "037_encrypted_video_results"
+EXPECTED_HEAD = "038_independent_emotion"
 
 
 class MigrationChainTests(unittest.TestCase):

@@ -1,0 +1,347 @@
+{
+  "title": "MDS01 system overview",
+  "direction": "LR",
+  "page_width": 1700,
+  "page_height": 980,
+  "auto_icons": false,
+  "nodes": [
+    {
+      "id": "browser",
+      "label": "<b>Owner's browser</b><br>Next.js frontend (:3000)<br>EEG-only \u00b7 video-only \u00b7 combined",
+      "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;",
+      "x": 30,
+      "y": 400,
+      "width": 230,
+      "height": 100
+    },
+    {
+      "id": "api",
+      "label": "<b>FastAPI backend</b> (:8000)<br>sign-in \u00b7 owner-only routes<br>private, no-store responses",
+      "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;",
+      "x": 320,
+      "y": 395,
+      "width": 210,
+      "height": 110
+    },
+    {
+      "id": "eeg",
+      "label": "<b>EEG processing</b> (BackgroundTasks)<br>validate \u2192 de-identify \u2192 preprocess<br>\u2192 SeizureTransformer \u2192 explanation",
+      "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;",
+      "x": 640,
+      "y": 90,
+      "width": 270,
+      "height": 100
+    },
+    {
+      "id": "vsvig",
+      "label": "<b>VSViG worker</b> (one at a time)<br>5-s pose gate \u2192 OpenPose<br>\u2192 15 RGB patches \u2192 VSViG scores",
+      "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;",
+      "x": 640,
+      "y": 290,
+      "width": 270,
+      "height": 100
+    },
+    {
+      "id": "emotion",
+      "label": "<b>Emotion worker</b> (own lane)<br>runs alongside VSViG, every clip<br>face \u2192 expression per second",
+      "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;",
+      "x": 640,
+      "y": 490,
+      "width": 270,
+      "height": 100
+    },
+    {
+      "id": "veeg",
+      "label": "<b>VEEG reference workers</b><br>clock/format probe \u00b7 EEG sync<br>H.264 copy only when opened",
+      "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;",
+      "x": 640,
+      "y": 690,
+      "width": 270,
+      "height": 100
+    },
+    {
+      "id": "enc-files",
+      "label": "<b>Encrypted files</b> (AES-GCM)<br>backend/storage/sessions/{id}/<br>original/ \u00b7 retained/<br>EEG archives, source report, original video,<br>review video, playback copy",
+      "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=12;",
+      "x": 1030,
+      "y": 80,
+      "width": 300,
+      "height": 120
+    },
+    {
+      "id": "tmp-files",
+      "label": "<b>Temporary plaintext</b><br>work/ \u00b7 emotion-work/<br>decrypted copies, frames, patches<br><i>deleted after each step and on restart</i>",
+      "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;dashed=1;strokeWidth=2;fontSize=12;",
+      "x": 1030,
+      "y": 330,
+      "width": 300,
+      "height": 110
+    },
+    {
+      "id": "pg",
+      "label": "<b>PostgreSQL</b><br><font color='#2d7a2d'>Encrypted rows:</font> VSViG results, emotion results,<br>patient name/ID, sync anchors, clinical notes<br><font color='#555555'>Plain rows:</font> users, cases, job status,<br>de-identified EEG scores + explanations",
+      "style": "shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;size=12;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;align=left;spacingLeft=10;",
+      "x": 1030,
+      "y": 560,
+      "width": 330,
+      "height": 170
+    },
+    {
+      "id": "keys",
+      "label": "<b>Keys</b> MDS01_STORAGE_KEY \u00b7<br>MDS01_TEMPLATE_KEY in .env<br>outside Git and backups",
+      "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;",
+      "x": 1440,
+      "y": 95,
+      "width": 220,
+      "height": 90
+    },
+    {
+      "id": "legend",
+      "label": "<b>Legend</b><br><font color='#2d7a2d'>\u25a0 green</font> encrypted at rest<br><font color='#b36b00'>\u25a0 orange dashed</font> temporary plaintext, deleted<br><font color='#6c8ebf'>\u25a0 blue</font> processing step<br><font color='#666666'>\u25a0 grey</font> database<br><br>Binaries never go in PostgreSQL.<br>All outputs are research-only.",
+      "style": "text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontSize=12;",
+      "x": 1440,
+      "y": 330,
+      "width": 230,
+      "height": 170
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-browser-api",
+      "source": "browser",
+      "target": "api",
+      "label": "HTTPS",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;"
+    },
+    {
+      "id": "e-api-enc",
+      "source": "api",
+      "target": "enc-files",
+      "label": "encrypt upload<br>before acknowledging",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;strokeColor=#82b366;strokeWidth=2;",
+      "points": [
+        {
+          "x": 425,
+          "y": 40
+        },
+        {
+          "x": 1180,
+          "y": 40
+        }
+      ]
+    },
+    {
+      "id": "e-api-eeg",
+      "source": "api",
+      "target": "eeg",
+      "label": "schedule",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;",
+      "points": [
+        {
+          "x": 580,
+          "y": 450
+        },
+        {
+          "x": 580,
+          "y": 140
+        }
+      ]
+    },
+    {
+      "id": "e-api-vsvig",
+      "source": "api",
+      "target": "vsvig",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;",
+      "points": [
+        {
+          "x": 580,
+          "y": 450
+        },
+        {
+          "x": 580,
+          "y": 340
+        }
+      ]
+    },
+    {
+      "id": "e-api-emotion",
+      "source": "api",
+      "target": "emotion",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;",
+      "points": [
+        {
+          "x": 580,
+          "y": 450
+        },
+        {
+          "x": 580,
+          "y": 540
+        }
+      ]
+    },
+    {
+      "id": "e-api-veeg",
+      "source": "api",
+      "target": "veeg",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;",
+      "points": [
+        {
+          "x": 580,
+          "y": 450
+        },
+        {
+          "x": 580,
+          "y": 740
+        }
+      ]
+    },
+    {
+      "id": "e-enc-tmp",
+      "source": "enc-files",
+      "target": "tmp-files",
+      "label": "decrypt a temporary<br>copy per step",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;dashed=1;strokeColor=#d79b00;"
+    },
+    {
+      "id": "e-eeg-tmp",
+      "source": "eeg",
+      "target": "tmp-files",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;dashed=1;strokeColor=#d79b00;",
+      "points": [
+        {
+          "x": 950,
+          "y": 140
+        },
+        {
+          "x": 950,
+          "y": 360
+        }
+      ]
+    },
+    {
+      "id": "e-vsvig-tmp",
+      "source": "vsvig",
+      "target": "tmp-files",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;dashed=1;strokeColor=#d79b00;",
+      "points": [
+        {
+          "x": 950,
+          "y": 340
+        },
+        {
+          "x": 950,
+          "y": 385
+        }
+      ]
+    },
+    {
+      "id": "e-emotion-tmp",
+      "source": "emotion",
+      "target": "tmp-files",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;dashed=1;strokeColor=#d79b00;",
+      "points": [
+        {
+          "x": 950,
+          "y": 540
+        },
+        {
+          "x": 950,
+          "y": 410
+        }
+      ]
+    },
+    {
+      "id": "e-enc-keys",
+      "source": "keys",
+      "target": "enc-files",
+      "label": "AES-GCM key",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;"
+    },
+    {
+      "id": "e-api-pg",
+      "source": "api",
+      "target": "pg",
+      "label": "owner-scoped reads",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;",
+      "points": [
+        {
+          "x": 425,
+          "y": 870
+        },
+        {
+          "x": 1195,
+          "y": 870
+        }
+      ]
+    },
+    {
+      "id": "e-eeg-pg",
+      "source": "eeg",
+      "target": "pg",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;",
+      "points": [
+        {
+          "x": 1000,
+          "y": 170
+        },
+        {
+          "x": 1000,
+          "y": 600
+        }
+      ]
+    },
+    {
+      "id": "e-vsvig-pg",
+      "source": "vsvig",
+      "target": "pg",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;",
+      "points": [
+        {
+          "x": 1000,
+          "y": 370
+        },
+        {
+          "x": 1000,
+          "y": 625
+        }
+      ]
+    },
+    {
+      "id": "e-emotion-pg",
+      "source": "emotion",
+      "target": "pg",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;",
+      "points": [
+        {
+          "x": 1000,
+          "y": 570
+        },
+        {
+          "x": 1000,
+          "y": 650
+        }
+      ]
+    },
+    {
+      "id": "e-veeg-pg",
+      "source": "veeg",
+      "target": "pg",
+      "label": "results + status<br>(every worker)",
+      "style": "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;labelBackgroundColor=#ffffff;fontSize=11;",
+      "points": [
+        {
+          "x": 1000,
+          "y": 740
+        },
+        {
+          "x": 1000,
+          "y": 690
+        }
+      ],
+      "label_at": {
+        "x": 1070,
+        "y": 770
+      }
+    }
+  ]
+}

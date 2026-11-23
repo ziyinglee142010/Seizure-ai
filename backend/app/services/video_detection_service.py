@@ -142,16 +142,30 @@ REFERENCE_PLAYBACK_PRIORITY_EXECUTOR = ThreadPoolExecutor(
 REFERENCE_PLAYBACK_SCHEDULE_LOCK = threading.Lock()
 REFERENCE_PLAYBACK_FUTURES: dict[str, Future[None]] = {}
 REFERENCE_PLAYBACK_RUNNING: set[str] = set()
+# Facial-expression analysis is its own lane. It starts at upload, runs at the
+# same time as VSViG (which keeps PROCESS_LOCK), and does not depend on VSViG
+# admission. One emotion run at a time bounds CPU and memory. The database
+# emotion_status is the durable queue; sweep(startup=True) re-enqueues it.
+EMOTION_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-emotion")
+EMOTION_TIMEOUT_SECONDS = 3600
+_EMOTION_ACTIVE_STATUSES = frozenset({"queued", "processing"})
 
 
-def _video_result_associated_data(job: VideoDetectionJob) -> bytes:
-    """Bind encrypted model output to its database owner and job row."""
+def _video_result_associated_data(
+    job: VideoDetectionJob, purpose: str = "MDS01-VIDEO-RESULT-v1"
+) -> bytes:
+    """Bind encrypted model output to its purpose, database owner, and job row."""
 
-    return f"MDS01-VIDEO-RESULT-v1:{job.owner_user_id}:{job.job_id}".encode("ascii")
+    return f"{purpose}:{job.owner_user_id}:{job.job_id}".encode("ascii")
 
 
-def encrypt_video_result(job: VideoDetectionJob, result: dict) -> tuple[bytes, bytes]:
-    """Encrypt one validated VSViG result for storage in PostgreSQL."""
+_EMOTION_RESULT_PURPOSE = "MDS01-VIDEO-EMOTION-v1"
+
+
+def encrypt_video_result(
+    job: VideoDetectionJob, result: dict, *, purpose: str = "MDS01-VIDEO-RESULT-v1"
+) -> tuple[bytes, bytes]:
+    """Encrypt one validated VSViG or emotion result for storage in PostgreSQL."""
 
     plaintext = json.dumps(
         result, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -162,7 +176,7 @@ def encrypt_video_result(job: VideoDetectionJob, result: dict) -> tuple[bytes, b
     ciphertext = AESGCM(read_base64_key(STORAGE_KEY_ENV)).encrypt(
         nonce,
         zlib.compress(plaintext),
-        _video_result_associated_data(job),
+        _video_result_associated_data(job, purpose),
     )
     return nonce, ciphertext
 
@@ -170,20 +184,39 @@ def encrypt_video_result(job: VideoDetectionJob, result: dict) -> tuple[bytes, b
 def read_encrypted_video_result(job: VideoDetectionJob) -> dict | None:
     """Decrypt a current database result, or return None for legacy file-only rows."""
 
-    if job.result_nonce is None and job.result_ciphertext is None:
+    return _decrypt_job_payload(
+        job, job.result_nonce, job.result_ciphertext, "MDS01-VIDEO-RESULT-v1"
+    )
+
+
+def read_encrypted_emotion_result(job: VideoDetectionJob) -> dict | None:
+    """Decrypt the independent facial-expression result, if one was stored."""
+
+    return _decrypt_job_payload(
+        job, job.emotion_nonce, job.emotion_ciphertext, _EMOTION_RESULT_PURPOSE
+    )
+
+
+def _decrypt_job_payload(
+    job: VideoDetectionJob,
+    nonce: bytes | None,
+    ciphertext: bytes | None,
+    purpose: str,
+) -> dict | None:
+    if nonce is None and ciphertext is None:
         return None
     if (
-        not isinstance(job.result_nonce, bytes)
-        or len(job.result_nonce) != 12
-        or not isinstance(job.result_ciphertext, bytes)
-        or not job.result_ciphertext
+        not isinstance(nonce, bytes)
+        or len(nonce) != 12
+        or not isinstance(ciphertext, bytes)
+        or not ciphertext
     ):
         raise DetectionError("invalid_model_output")
     try:
         compressed = AESGCM(read_base64_key(STORAGE_KEY_ENV)).decrypt(
-            job.result_nonce,
-            job.result_ciphertext,
-            _video_result_associated_data(job),
+            nonce,
+            ciphertext,
+            _video_result_associated_data(job, purpose),
         )
         decompressor = zlib.decompressobj()
         plaintext = decompressor.decompress(compressed, _VIDEO_RESULT_MAX_BYTES + 1)
@@ -213,6 +246,136 @@ def enqueue_reference_metadata(job_id: str) -> None:
     except RuntimeError:
         # Executor shutdown leaves the durable metadata_pending row for sweep().
         LOGGER.warning("Reference metadata worker is shutting down; job remains pending.")
+
+
+def enqueue_emotion(job_id: str) -> None:
+    """Start facial-expression analysis without waiting for VSViG."""
+
+    try:
+        EMOTION_EXECUTOR.submit(process_emotion_job, job_id)
+    except RuntimeError:
+        # Executor shutdown leaves the durable queued row for sweep(startup=True).
+        LOGGER.warning("Emotion worker is shutting down; job remains queued.")
+
+
+def start_emotion_lane(db: Session, job: VideoDetectionJob) -> bool:
+    """Persist the new upload's emotion status; True when a run should start."""
+
+    status = initial_emotion_status(job)
+    if job.emotion_status != status:
+        job.emotion_status = status
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+    return status == "queued"
+
+
+def initial_emotion_status(job: VideoDetectionJob) -> str:
+    """Return the emotion lane status for a newly stored upload."""
+
+    if job.reference_only:
+        return "not_applicable"
+    if not EMOTION_RECOGNITION_ENABLED:
+        return "disabled"
+    return "queued" if job.original_path else "unavailable"
+
+
+class _EmotionWorkArea:
+    """Point the emotion step's work files at the emotion-only plaintext area."""
+
+    def __init__(self, storage: VideoStorage) -> None:
+        self._storage = storage
+
+    def work_path(self, job_id: str, name: str) -> Path:
+        if Path(name).name != name or not name:
+            raise StorageError("Emotion work name is invalid.")
+        return self._storage.emotion_work_dir(job_id) / name
+
+    def delete_work_file(self, path: Path) -> None:
+        if path.parent.name != "emotion-work" or path.is_symlink():
+            raise StorageError("Emotion work path is invalid.")
+        path.unlink(missing_ok=True)
+
+
+def _claim_emotion_job(job_id: str) -> bool:
+    """Atomically move one queued emotion run to processing."""
+
+    with Session(engine) as db:
+        claimed = db.exec(
+            update(VideoDetectionJob)
+            .where(VideoDetectionJob.job_id == job_id)
+            .where(VideoDetectionJob.emotion_status == "queued")
+            .values(emotion_status="processing")
+        )
+        won = claimed.rowcount == 1
+        db.commit()
+        return won
+
+
+def _store_emotion_outcome(job_id: str, status: str, result: dict | None) -> None:
+    """Write only the emotion columns, so concurrent VSViG updates are kept."""
+
+    with Session(engine) as db:
+        job = repository.get_job(db, job_id, None)
+        if job is None:
+            return
+        values: dict[str, object] = {"emotion_status": status}
+        if result is not None:
+            values["emotion_nonce"], values["emotion_ciphertext"] = encrypt_video_result(
+                job, result, purpose=_EMOTION_RESULT_PURPOSE
+            )
+        db.exec(
+            update(VideoDetectionJob)
+            .where(VideoDetectionJob.job_id == job_id)
+            .values(**values)
+        )
+        db.commit()
+
+
+def process_emotion_job(job_id: str) -> None:
+    """Analyse visible facial expression independently of VSViG admission.
+
+    The source is decrypted into the emotion-only area under a read lease, so
+    VSViG cleanup cannot remove it mid-read. Only per-second expression scores
+    are kept, encrypted in PostgreSQL; the plaintext area is always removed.
+    """
+
+    if not _claim_emotion_job(job_id):
+        return
+    storage = VideoStorage()
+    status, result = "failed", None
+    try:
+        with Session(engine) as db:
+            job = repository.get_job(db, job_id, None)
+            original = job.original_path if job is not None else None
+        if not original:
+            status = "unavailable"
+            return
+        with storage._storage.read_lease(job_id):
+            source = storage.materialize_original_for_emotion(job_id, Path(original))
+        result = _run_emotion_recognition(
+            source, job_id, _EmotionWorkArea(storage), EMOTION_TIMEOUT_SECONDS
+        )
+        status = "complete" if result.get("status") == "complete" else (
+            "disabled" if result.get("status") == "disabled" else "failed"
+        )
+        if status != "complete":
+            result = {key: result[key] for key in ("status", "error_code") if key in result}
+        result["input"] = (
+            "transient unblurred source frames; only per-second expression scores are stored"
+        )
+    except Exception as exc:
+        LOGGER.warning("Emotion job failed safely; exception_type=%s", type(exc).__name__)
+        status, result = "failed", {"status": "failed", "error_code": "emotion_failed"}
+    finally:
+        try:
+            storage.remove_emotion_work(job_id)
+        except Exception:
+            LOGGER.warning("Emotion work cleanup is pending; retrying at next startup.")
+        try:
+            _store_emotion_outcome(job_id, status, result)
+        except Exception:
+            LOGGER.warning("Emotion result could not be stored; job remains recoverable.")
 
 
 def enqueue_reference_playback(job_id: str) -> None:
@@ -667,7 +830,19 @@ def _make_private_review_copy(
     """Retain an encrypted, audio-free review video after model rejection/failure."""
 
     if job.retention_expires_at is None:
-        return _make_unblurred_review_copy(db, storage, job)
+        # Retained (unblurred) owner review. The copy itself does not settle the
+        # job, so record a terminal stage here; otherwise a rejected clip stays
+        # "processing" forever and the browser keeps polling. Keep the model
+        # rejection reason, which the review copy would otherwise overwrite.
+        rejection_code = job.error_code
+        review_ready = _make_unblurred_review_copy(db, storage, job)
+        job.status = "failed"
+        job.current_stage = "privacy-review-ready" if review_ready else "privacy-review-failed"
+        if rejection_code:
+            job.error_code = rejection_code
+        db.add(job)
+        db.commit()
+        return review_ready
     source: Path | None = None
     try:
         if expired(job) or not job.original_path:
@@ -922,6 +1097,7 @@ def public_job(db, job, storage):
             else None
         ),
         "error": ERRORS.get(job.error_code) if job.status != "ready" else None,
+        "emotion_status": job.emotion_status,
         "review_warning": REVIEW_WARNINGS.get(job.error_code) if job.reference_only else None,
         "research_only": True,
         "sync": sync,
@@ -1452,14 +1628,8 @@ def process_job(_trigger_job_id: str):
                 "review_required": bool(visualization_meta["quality_flags"]),
                 "audio_policy": "review playback excludes audio; encrypted originals and results are retained until case deletion" if job.retention_expires_at is None else "audio is excluded; only the face-blurred, audio-free review video and encrypted predictions are retained until expiry",
             }
-            job.current_stage = "emotion-recognition"
-            db.add(job)
-            db.commit()
-            result["emotion"] = _run_emotion_recognition(source, job_id, storage, remaining())
-            if result["emotion"]["status"] == "complete":
-                result["privacy"]["emotion_input"] = (
-                    "transient unblurred source frames; only per-second expression scores are stored"
-                )
+            # Facial expression is analysed by the independent emotion lane
+            # (process_emotion_job), not as a VSViG stage.
             output.write_text(json.dumps(result, allow_nan=False))
             if expired(job):
                 expire_job(db, job, storage, force=True)
@@ -1752,8 +1922,26 @@ def sweep(*, startup=False):
         return
     pending_metadata: list[str] = []
     recovery_playback: list[str] = []
+    recovery_emotion: list[str] = []
     with Session(engine) as db:
         if startup:
+            # Emotion runs are process-local threads. Remove any plaintext an
+            # interrupted run left behind and queue it again; the encrypted
+            # original is retained until case deletion, so it can be re-read.
+            for job in repository.list_all_jobs_for_cleanup(db):
+                if job.emotion_status not in _EMOTION_ACTIVE_STATUSES:
+                    continue
+                try:
+                    storage.remove_emotion_work(job.job_id)
+                except Exception:
+                    LOGGER.warning("Interrupted emotion cleanup is pending.")
+                if job.original_path and job.status != "expired":
+                    job.emotion_status = "queued"
+                    recovery_emotion.append(job.job_id)
+                else:
+                    job.emotion_status = "unavailable"
+                db.add(job)
+            db.commit()
             # BackgroundTasks are process-local. A conversion interrupted by a
             # restart becomes requestable again; valid committed output survives.
             for job in repository.list_all_jobs_for_cleanup(db):
@@ -1868,6 +2056,8 @@ def sweep(*, startup=False):
     # resume work that was already in progress when the process restarted.
     for job_id in pending_metadata:
         enqueue_reference_metadata(job_id)
+    for job_id in recovery_emotion:
+        enqueue_emotion(job_id)
     for job_id in recovery_playback:
         job, claimed = _claim_reference_playback_for_recovery(job_id)
         if claimed and job is not None:

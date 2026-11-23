@@ -4,6 +4,7 @@ import {
   EMOTION_LABELS,
   type EmotionLabel,
   type EmotionResult,
+  type EmotionStatus,
 } from "@/lib/video-detection";
 
 const EMOTION_NAMES: Record<EmotionLabel | "no_face", string> = {
@@ -29,9 +30,19 @@ function clock(seconds: number) {
   return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
 }
 
-/** Per-second facial expression for one analysed video; separate from VSViG. */
-export function VideoEmotionPanel({ emotion }: { emotion?: EmotionResult }) {
-  if (!emotion || emotion.status === "disabled") return null;
+/**
+ * Per-second facial expression for one uploaded video. It runs as its own job
+ * alongside VSViG, so it can finish before VSViG or after VSViG rejects a clip.
+ */
+export function VideoEmotionPanel({
+  emotion,
+  status,
+}: {
+  emotion?: EmotionResult;
+  status?: EmotionStatus;
+}) {
+  const pending = status === "queued" || status === "processing";
+  if (!pending && (!emotion || emotion.status === "disabled")) return null;
 
   return (
     <section
@@ -45,13 +56,19 @@ export function VideoEmotionPanel({ emotion }: { emotion?: EmotionResult }) {
         Visible facial expression over time
       </h2>
 
-      {emotion.status === "failed" ? (
+      {!emotion || emotion.status === "disabled" ? (
+        <p className="mt-4 text-sm leading-6 text-ink-muted" role="status">
+          {status === "queued"
+            ? "Waiting to start. Facial expression runs separately from VSViG, so it does not need the pose check to pass."
+            : "Reading the visible facial expression each second. This runs at the same time as VSViG."}
+        </p>
+      ) : emotion.status === "failed" ? (
         <p
           className="mt-4 rounded-md border border-amber/40 bg-amber-soft px-4 py-3 text-sm leading-6"
           role="status"
         >
-          Facial expression analysis did not complete for this video. The VSViG
-          seizure scores above are unaffected.
+          Facial expression analysis did not complete for this video. VSViG
+          analysis is unaffected.
         </p>
       ) : (
         <EmotionDetails emotion={emotion} />
